@@ -33,7 +33,7 @@ jobs:
             cargo-tool: cross
           - os: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
-            binary: armv7
+            binary: armhf
             cargo-tool: cross
           # macos>=14 runs exclusively on aarch64 and will thus fail to execute properly for x64
           - os: macos-13
