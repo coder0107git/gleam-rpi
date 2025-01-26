@@ -116,6 +116,8 @@ jobs:
               ./gleam.exe --version ;;
             aarch64*)
               echo "We cannot test an ARM binary on a AMD64 runner" ;;
+            armv7*)
+              echo "We cannot test an ARM binary on a AMD64 runner" ;;
             *)
               tar -xvzf "$ASSET"
               ./gleam --version ;;
