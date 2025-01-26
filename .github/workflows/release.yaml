@@ -17,6 +17,7 @@ jobs:
         target:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-gnueabihf
           - x86_64-apple-darwin
           - aarch64-apple-darwin
           - x86_64-pc-windows-msvc
@@ -29,6 +30,10 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             binary: aarch64
+            cargo-tool: cross
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            binary: armv7
             cargo-tool: cross
           # macos>=14 runs exclusively on aarch64 and will thus fail to execute properly for x64
           - os: macos-13
