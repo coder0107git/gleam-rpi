@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+Dedicated to the memory of Len Pilfold.
+
+## v1.8.0-rc1 - 2025-02-03
 
 ### Compiler
 
@@ -64,6 +66,11 @@
   The custom type variant constructor `X` is not in scope here.
   ```
 
+  ([Roeeeee](https://github.com/5c077m4n))
+
+- Erlang `file` module attributes now use paths relative to the root.
+  ([Kasim](https://github.com/oneness))
+
 ### Build tool
 
 - `gleam new` now has refined project name validation - rather than failing on
@@ -86,7 +93,8 @@
     -h, --help               Print help
   ```
 
-  For example, if the root project (`project_a`) depends on `package_b` and `package_c`, and `package_c` also depends on `package_b`, the output will be:
+  For example, if the root project (`project_a`) depends on `package_b` and
+  `package_c`, and `package_c` also depends on `package_b`, the output will be:
 
 
   ```markdown
@@ -112,6 +120,11 @@
   ```
 
   ([Ramkarthik Krishnamurthy](https://github.com/ramkarthik))
+
+- The build tool now checks for modules that would collide with the new Erlang
+  `json` module in addition to the existing Erlang modules it already checked
+  for.
+  ([Louis Pilfold](https://github.com/lpil))
 
 ### Language server
 
