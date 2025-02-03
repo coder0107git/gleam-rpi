@@ -35,6 +35,7 @@ jobs:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-gnu
           - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-gnueabihf
           - x86_64-apple-darwin
           - x86_64-pc-windows-msvc
         include:
@@ -58,6 +59,11 @@ jobs:
             binary: aarch64
             cargo-tool: cross
             run-integration-tests: false # Cannot run aarch64 binaries on x86_64
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            binary: armhf
+            cargo-tool: cross
+            run-integration-tests: false # Cannot run armv7 binaries on x86_64
           # macos>=14 runs exclusively on aarch64 and will thus fail to execute properly for x64
           - os: macos-13 # intel
             target: x86_64-apple-darwin
