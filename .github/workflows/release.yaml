@@ -15,18 +15,10 @@ jobs:
     strategy:
       matrix:
         target:
-          - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
           - armv7-unknown-linux-gnueabihf
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
-          - x86_64-pc-windows-msvc
         toolchain: [stable]
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            binary: x86-64
-            cargo-tool: cross
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             binary: aarch64
@@ -35,19 +27,6 @@ jobs:
             target: armv7-unknown-linux-gnueabihf
             binary: armhf
             cargo-tool: cross
-          # macos>=14 runs exclusively on aarch64 and will thus fail to execute properly for x64
-          - os: macos-13
-            target: x86_64-apple-darwin
-            binary: x86_64
-            cargo-tool: cargo
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            binary: arm64
-            cargo-tool: cargo
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: x86-64
-            cargo-tool: cargo
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
