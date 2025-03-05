@@ -58,6 +58,12 @@ impl TypedModule {
             .iter()
             .find_map(|statement| statement.find_node(byte_index))
     }
+
+    pub fn find_statement(&self, byte_index: u32) -> Option<&TypedStatement> {
+        self.definitions
+            .iter()
+            .find_map(|definition| definition.find_statement(byte_index))
+    }
 }
 
 /// The `@target(erlang)` and `@target(javascript)` attributes can be used to
@@ -413,7 +419,9 @@ impl TypeAst {
                     None
                 })
                 .or(Some(Located::Annotation(self.location(), type_))),
-            TypeAst::Constructor(TypeAstConstructor { arguments, .. }) => type_
+            TypeAst::Constructor(TypeAstConstructor {
+                arguments, module, ..
+            }) => type_
                 .constructor_types()
                 .and_then(|arg_types| {
                     if let Some(arg) = arguments
@@ -426,6 +434,17 @@ impl TypeAst {
 
                     None
                 })
+                .or(module.as_ref().and_then(|(name, location)| {
+                    if location.contains(byte_index) {
+                        Some(Located::ModuleName {
+                            location: *location,
+                            name,
+                            layer: Layer::Type,
+                        })
+                    } else {
+                        None
+                    }
+                }))
                 .or(Some(Located::Annotation(self.location(), type_))),
             TypeAst::Tuple(TypeAstTuple { elems, .. }) => type_
                 .tuple_types()
@@ -965,6 +984,23 @@ impl TypedDefinition {
             }
         }
     }
+
+    pub fn find_statement(&self, byte_index: u32) -> Option<&TypedStatement> {
+        match self {
+            Definition::Function(function) => {
+                if !function.full_location().contains(byte_index) {
+                    return None;
+                }
+
+                function
+                    .body
+                    .iter()
+                    .find_map(|statement| statement.find_statement(byte_index))
+            }
+
+            _ => None,
+        }
+    }
 }
 
 impl<A, B, C, E> Definition<A, B, C, E> {
@@ -1264,21 +1300,33 @@ impl CallArg<TypedExpr> {
                 .or_else(|| body.iter().find_map(|s| s.find_node(byte_index))),
             // In all other cases we're happy with the default behaviour.
             //
-            _ => {
-                if let Some(located) = self.value.find_node(byte_index) {
-                    Some(located)
-                } else if self.location.contains(byte_index) && self.label.is_some() {
-                    Some(Located::Label(self.location, self.value.type_()))
-                } else {
-                    None
+            _ => match self.value.find_node(byte_index) {
+                Some(located) => Some(located),
+                _ => {
+                    if self.location.contains(byte_index) && self.label.is_some() {
+                        Some(Located::Label(self.location, self.value.type_()))
+                    } else {
+                        None
+                    }
                 }
+            },
+        }
+    }
+
+    pub fn find_statement(&self, byte_index: u32) -> Option<&TypedStatement> {
+        match (self.implicit, &self.value) {
+            (Some(ImplicitCallArgOrigin::Use), TypedExpr::Invalid { .. }) => None,
+            (Some(ImplicitCallArgOrigin::Use), TypedExpr::Fn { body, .. }) => {
+                body.iter().find_map(|s| s.find_statement(byte_index))
             }
+
+            _ => self.value.find_statement(byte_index),
         }
     }
 
     pub fn is_capture_hole(&self) -> bool {
         match &self.value {
-            TypedExpr::Var { ref name, .. } => name == CAPTURE_VARIABLE,
+            TypedExpr::Var { name, .. } => name == CAPTURE_VARIABLE,
             _ => false,
         }
     }
@@ -1286,12 +1334,15 @@ impl CallArg<TypedExpr> {
 
 impl CallArg<TypedPattern> {
     pub fn find_node(&self, byte_index: u32) -> Option<Located<'_>> {
-        if let Some(located) = self.value.find_node(byte_index) {
-            Some(located)
-        } else if self.location.contains(byte_index) && self.label.is_some() {
-            Some(Located::Label(self.location, self.value.type_()))
-        } else {
-            None
+        match self.value.find_node(byte_index) {
+            Some(located) => Some(located),
+            _ => {
+                if self.location.contains(byte_index) && self.label.is_some() {
+                    Some(Located::Label(self.location, self.value.type_()))
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -1299,7 +1350,7 @@ impl CallArg<TypedPattern> {
 impl CallArg<UntypedExpr> {
     pub fn is_capture_hole(&self) -> bool {
         match &self.value {
-            UntypedExpr::Var { ref name, .. } => name == CAPTURE_VARIABLE,
+            UntypedExpr::Var { name, .. } => name == CAPTURE_VARIABLE,
             _ => false,
         }
     }
@@ -1697,8 +1748,8 @@ impl SrcSpan {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub struct DefinitionLocation<'module> {
-    pub module: Option<&'module str>,
+pub struct DefinitionLocation {
+    pub module: Option<EcoString>,
     pub span: SrcSpan,
 }
 
@@ -1878,7 +1929,7 @@ impl<A> Pattern<A> {
 }
 
 impl TypedPattern {
-    pub fn definition_location(&self) -> Option<DefinitionLocation<'_>> {
+    pub fn definition_location(&self) -> Option<DefinitionLocation> {
         match self {
             Pattern::Int { .. }
             | Pattern::Float { .. }
@@ -2450,7 +2501,7 @@ impl TypedStatement {
         }
     }
 
-    pub fn definition_location(&self) -> Option<DefinitionLocation<'_>> {
+    pub fn definition_location(&self) -> Option<DefinitionLocation> {
         match self {
             Statement::Expression(expression) => expression.definition_location(),
             Statement::Assignment(_) => None,
@@ -2469,6 +2520,22 @@ impl TypedStatement {
                     None
                 }
             }),
+        }
+    }
+
+    pub fn find_statement(&self, byte_index: u32) -> Option<&TypedStatement> {
+        match self {
+            Statement::Use(use_) => use_.call.find_statement(byte_index),
+            Statement::Expression(expression) => expression.find_statement(byte_index),
+            Statement::Assignment(assignment) => {
+                assignment.value.find_statement(byte_index).or_else(|| {
+                    if assignment.location.contains(byte_index) {
+                        Some(self)
+                    } else {
+                        None
+                    }
+                })
+            }
         }
     }
 
@@ -2554,9 +2621,11 @@ pub struct TypedPipelineAssignment {
 
 impl TypedPipelineAssignment {
     pub fn find_node(&self, byte_index: u32) -> Option<Located<'_>> {
-        self.value
-            .find_node(byte_index)
-            .or_else(|| self.value.find_node(byte_index))
+        self.value.find_node(byte_index)
+    }
+
+    pub fn find_statement(&self, byte_index: u32) -> Option<&TypedStatement> {
+        self.value.find_statement(byte_index)
     }
 
     pub fn type_(&self) -> Arc<Type> {
@@ -2583,4 +2652,7 @@ pub enum PipelineAssignmentKind {
 
     /// In case `a |> b(c)` is desugared to `b(c)(a)`
     FunctionCall,
+
+    /// In case there's an echo in the middle of a pipeline `a |> echo`
+    Echo,
 }

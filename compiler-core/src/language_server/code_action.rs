@@ -1,37 +1,38 @@
 use std::{collections::HashSet, iter, sync::Arc};
 
 use crate::{
+    Error, STDLIB_PACKAGE_NAME,
     ast::{
-        self,
-        visit::{visit_typed_call_arg, visit_typed_pattern_call_arg, Visit as _},
-        AssignName, AssignmentKind, CallArg, FunctionLiteralKind, ImplicitCallArgOrigin, Pattern,
-        PipelineAssignmentKind, SrcSpan, TodoKind, TypedArg, TypedAssignment, TypedExpr,
-        TypedModuleConstant, TypedPattern, TypedPipelineAssignment, TypedStatement, TypedUse,
+        self, AssignName, AssignmentKind, CallArg, FunctionLiteralKind, ImplicitCallArgOrigin,
+        Pattern, PipelineAssignmentKind, SrcSpan, TodoKind, TypedArg, TypedAssignment, TypedExpr,
+        TypedModuleConstant, TypedPattern, TypedPipelineAssignment, TypedRecordConstructor,
+        TypedStatement, TypedUse,
+        visit::{Visit as _, visit_typed_call_arg, visit_typed_pattern_call_arg},
     },
     build::{Located, Module},
     io::{BeamCompiler, CommandExecutor, FileSystemReader, FileSystemWriter},
     line_numbers::LineNumbers,
     parse::{extra::ModuleExtra, lexer::str_to_keyword},
     type_::{
-        self,
+        self, FieldMap, ModuleValueConstructor, Type, TypeVar, TypedCallArg, ValueConstructor,
         error::{ModuleSuggestion, VariableOrigin},
         printer::{Names, Printer},
-        FieldMap, ModuleValueConstructor, Type, TypeVar, TypedCallArg, ValueConstructor,
     },
-    Error, STDLIB_PACKAGE_NAME,
 };
-use ecow::{eco_format, EcoString};
+use ecow::{EcoString, eco_format};
 use heck::ToSnakeCase;
 use im::HashMap;
 use itertools::Itertools;
 use lsp_types::{CodeAction, CodeActionKind, CodeActionParams, Position, Range, TextEdit, Url};
-use vec1::{vec1, Vec1};
+use vec1::{Vec1, vec1};
 
 use super::{
+    TextEdits,
     compiler::LspProjectCompiler,
     edits::{add_newlines_after_import, get_import_edit, position_of_first_definition_if_import},
     engine::{overlaps, within},
-    src_span_to_lsp_range, TextEdits,
+    rename::find_variable_references,
+    src_span_to_lsp_range,
 };
 
 #[derive(Debug)]
@@ -865,10 +866,9 @@ pub fn code_action_import_module(
                 ))
             };
 
-            let title = if let Some(import) = &suggestion.import {
-                &format!("Import `{import}`")
-            } else {
-                &format!("Did you mean `{}`", suggestion.name)
+            let title = match &suggestion.import {
+                Some(import) => &format!("Import `{import}`"),
+                _ => &format!("Did you mean `{}`", suggestion.name),
             };
 
             CodeActionBuilder::new(title)
@@ -1257,6 +1257,7 @@ impl<'a> QualifiedToUnqualifiedImportFirstPass<'a> {
             qualified_constructor: None,
         }
     }
+
     fn get_module_import(
         &self,
         module_name: &EcoString,
@@ -1332,19 +1333,15 @@ impl<'ast> ast::visit::Visit<'ast> for QualifiedToUnqualifiedImportFirstPass<'as
     ) {
         let range = src_span_to_lsp_range(*location, &self.line_numbers);
         if overlaps(self.params.range, range) {
-            if let Some((module_alias, module_location)) = module {
-                if let Some(import) =
-                    self.module
-                        .find_node(module_location.start)
-                        .and_then(|node| {
-                            if let Located::Annotation(_, ty) = node {
-                                if let Some((module, _)) = ty.named_type_name() {
-                                    return self.get_module_import(&module, name, ast::Layer::Type);
-                                }
-                            }
-                            None
-                        })
-                {
+            if let Some((module_alias, _)) = module {
+                if let Some(import) = self.module.find_node(location.end).and_then(|node| {
+                    if let Located::Annotation(_, ty) = node {
+                        if let Some((module, _)) = ty.named_type_name() {
+                            return self.get_module_import(&module, name, ast::Layer::Type);
+                        }
+                    }
+                    None
+                }) {
                     self.qualified_constructor = Some(QualifiedConstructor {
                         import,
                         module_aliased: import.as_name.is_some(),
@@ -1361,6 +1358,7 @@ impl<'ast> ast::visit::Visit<'ast> for QualifiedToUnqualifiedImportFirstPass<'as
     fn visit_typed_expr_module_select(
         &mut self,
         location: &'ast SrcSpan,
+        field_start: &'ast u32,
         type_: &'ast Arc<Type>,
         label: &'ast EcoString,
         module_name: &'ast EcoString,
@@ -1372,9 +1370,7 @@ impl<'ast> ast::visit::Visit<'ast> for QualifiedToUnqualifiedImportFirstPass<'as
         // option.Some
         //  ↑
         // This allows us to offer a code action when hovering over the module name.
-        let expanded_location =
-            SrcSpan::new(location.start - module_name.len() as u32, location.end);
-        let range = src_span_to_lsp_range(expanded_location, &self.line_numbers);
+        let range = src_span_to_lsp_range(*location, &self.line_numbers);
         if overlaps(self.params.range, range) {
             if let ModuleValueConstructor::Record {
                 name: constructor_name,
@@ -1397,6 +1393,7 @@ impl<'ast> ast::visit::Visit<'ast> for QualifiedToUnqualifiedImportFirstPass<'as
         ast::visit::visit_typed_expr_module_select(
             self,
             location,
+            field_start,
             type_,
             label,
             module_name,
@@ -1453,12 +1450,6 @@ pub struct QualifiedToUnqualifiedImportSecondPass<'a> {
     qualified_constructor: QualifiedConstructor<'a>,
 }
 
-enum QualifiedConstructorType {
-    Type,
-    RecordValue,
-    PatternRecord,
-}
-
 impl<'a> QualifiedToUnqualifiedImportSecondPass<'a> {
     pub fn new(
         module: &'a Module,
@@ -1492,29 +1483,11 @@ impl<'a> QualifiedToUnqualifiedImportSecondPass<'a> {
         action
     }
 
-    fn remove_module_qualifier(
-        &mut self,
-        location: SrcSpan,
-        constructor: QualifiedConstructorType,
-    ) {
-        // Find the start and end of the module qualifier
-
-        // The src_span for Type Constructors and Pattern Record Constructors is
-        // : option.Option / option.Some but for Record Constructors is: option.Some
-        //   ↑           ↑   ↑         ↑                                       ↑   ↑
-        // start       end start      end                                    start end
-        let span = if matches!(constructor, QualifiedConstructorType::RecordValue) {
-            SrcSpan::new(
-                location.start - self.qualified_constructor.used_name.len() as u32,
-                location.start + 1,
-            )
-        } else {
-            SrcSpan::new(
-                location.start,
-                location.start + self.qualified_constructor.used_name.len() as u32 + 1, // plus .
-            )
-        };
-        self.edits.delete(span);
+    fn remove_module_qualifier(&mut self, location: SrcSpan) {
+        self.edits.delete(SrcSpan {
+            start: location.start,
+            end: location.start + self.qualified_constructor.used_name.len() as u32 + 1, // plus .
+        })
     }
 
     fn edit_import(&mut self) {
@@ -1692,7 +1665,7 @@ impl<'ast> ast::visit::Visit<'ast> for QualifiedToUnqualifiedImportSecondPass<'a
             } = &self.qualified_constructor;
 
             if !layer.is_value() && used_name == module_name && name == constructor {
-                self.remove_module_qualifier(*location, QualifiedConstructorType::Type);
+                self.remove_module_qualifier(*location);
             }
         }
         ast::visit::visit_type_ast_constructor(self, location, module, name, arguments);
@@ -1701,6 +1674,7 @@ impl<'ast> ast::visit::Visit<'ast> for QualifiedToUnqualifiedImportSecondPass<'a
     fn visit_typed_expr_module_select(
         &mut self,
         location: &'ast SrcSpan,
+        field_start: &'ast u32,
         type_: &'ast Arc<Type>,
         label: &'ast EcoString,
         module_name: &'ast EcoString,
@@ -1716,12 +1690,13 @@ impl<'ast> ast::visit::Visit<'ast> for QualifiedToUnqualifiedImportSecondPass<'a
             } = &self.qualified_constructor;
 
             if layer.is_value() && used_name == module_alias && name == constructor {
-                self.remove_module_qualifier(*location, QualifiedConstructorType::RecordValue);
+                self.remove_module_qualifier(*location);
             }
         }
         ast::visit::visit_typed_expr_module_select(
             self,
             location,
+            field_start,
             type_,
             label,
             module_name,
@@ -1750,10 +1725,7 @@ impl<'ast> ast::visit::Visit<'ast> for QualifiedToUnqualifiedImportSecondPass<'a
                 } = &self.qualified_constructor;
 
                 if layer.is_value() && used_name == module_alias && name == constructor {
-                    self.remove_module_qualifier(
-                        *location,
-                        QualifiedConstructorType::PatternRecord,
-                    );
+                    self.remove_module_qualifier(*location);
                 }
             }
         }
@@ -2190,16 +2162,17 @@ pub fn code_action_convert_unqualified_constructor_to_qualified(
     actions.extend(new_actions);
 }
 
-/// Builder for code action to apply the desugar use expression.
+/// Builder for code action to apply the convert from use action, turning a use
+/// expression into a regular function call.
 ///
-pub struct DesugarUse<'a> {
+pub struct ConvertFromUse<'a> {
     module: &'a Module,
     params: &'a CodeActionParams,
     edits: TextEdits<'a>,
     selected_use: Option<&'a TypedUse>,
 }
 
-impl<'a> DesugarUse<'a> {
+impl<'a> ConvertFromUse<'a> {
     pub fn new(
         module: &'a Module,
         line_numbers: &'a LineNumbers,
@@ -2381,7 +2354,7 @@ impl<'a> DesugarUse<'a> {
     }
 }
 
-impl<'ast> ast::visit::Visit<'ast> for DesugarUse<'ast> {
+impl<'ast> ast::visit::Visit<'ast> for ConvertFromUse<'ast> {
     fn visit_typed_use(&mut self, use_: &'ast TypedUse) {
         // We only want to take into account the innermost use we find ourselves
         // into, so we can't stop at the first use we find (the outermost one)
@@ -2414,9 +2387,9 @@ impl<'ast> ast::visit::Visit<'ast> for DesugarUse<'ast> {
     }
 }
 
-/// Builder for code action to apply the turn into use expression.
+/// Builder for code action to apply the convert to use action.
 ///
-pub struct TurnIntoUse<'a> {
+pub struct ConvertToUse<'a> {
     module: &'a Module,
     params: &'a CodeActionParams,
     edits: TextEdits<'a>,
@@ -2434,7 +2407,7 @@ struct CallLocations {
     callback_body_span: SrcSpan,
 }
 
-impl<'a> TurnIntoUse<'a> {
+impl<'a> ConvertToUse<'a> {
     pub fn new(
         module: &'a Module,
         line_numbers: &'a LineNumbers,
@@ -2533,7 +2506,7 @@ impl<'a> TurnIntoUse<'a> {
     }
 }
 
-impl<'ast> ast::visit::Visit<'ast> for TurnIntoUse<'ast> {
+impl<'ast> ast::visit::Visit<'ast> for ConvertToUse<'ast> {
     fn visit_typed_function(&mut self, fun: &'ast ast::TypedFunction) {
         // The cursor has to be inside the last statement of the function to
         // offer the code action.
@@ -3021,24 +2994,14 @@ impl<'a> GenerateDynamicDecoder<'a> {
     pub fn code_actions(&mut self) {
         self.visit_typed_module(&self.module.ast);
     }
-}
 
-impl<'ast> ast::visit::Visit<'ast> for GenerateDynamicDecoder<'ast> {
-    fn visit_typed_custom_type(&mut self, custom_type: &'ast ast::TypedCustomType) {
-        let range = self.edits.src_span_to_lsp_range(custom_type.location);
-        if !overlaps(self.params.range, range) {
-            return;
-        }
-
-        // For now, we only generate dynamic decoders for types with one variant.
-        let constructor = match custom_type.constructors.as_slice() {
-            [constructor] => constructor,
-            _ => return,
-        };
-
-        let name = eco_format!("{}_decoder", custom_type.name.to_snake_case());
-
-        let Some(fields): Option<Vec<_>> = constructor
+    fn generate_decoder_for_variant(
+        &mut self,
+        custom_type: &'a ast::TypedCustomType,
+        constructor: &'a TypedRecordConstructor,
+        indent: usize,
+    ) -> Option<EcoString> {
+        let fields = constructor
             .arguments
             .iter()
             .map(|argument| {
@@ -3049,10 +3012,7 @@ impl<'ast> ast::visit::Visit<'ast> for GenerateDynamicDecoder<'ast> {
                     type_: &argument.type_,
                 })
             })
-            .collect()
-        else {
-            return;
-        };
+            .collect::<Option<Vec<_>>>()?;
 
         let mut decoder_printer = DecoderPrinter::new(
             &self.module.ast.names,
@@ -3062,20 +3022,71 @@ impl<'ast> ast::visit::Visit<'ast> for GenerateDynamicDecoder<'ast> {
 
         let decoders = fields
             .iter()
-            .map(|field| decoder_printer.decode_field(field, 2))
+            .map(|field| decoder_printer.decode_field(field, indent + 2))
             .join("\n");
-
-        let decoder_type = self.printer.print_type(&Type::Named {
-            publicity: ast::Publicity::Public,
-            package: STDLIB_PACKAGE_NAME.into(),
-            module: DECODE_MODULE.into(),
-            name: "Decoder".into(),
-            args: vec![],
-            inferred_variant: None,
-        });
         let decode_module = self.printer.print_module(DECODE_MODULE);
 
         let mut field_names = fields.iter().map(|field| field.label.variable_name());
+
+        Some(eco_format!(
+            "{{
+{decoders}
+{indent}  {decode_module}.success({constructor_name}({fields}:))
+{indent}}}",
+            constructor_name = constructor.name,
+            fields = field_names.join(":, "),
+            indent = " ".repeat(indent),
+        ))
+    }
+}
+
+impl<'ast> ast::visit::Visit<'ast> for GenerateDynamicDecoder<'ast> {
+    fn visit_typed_custom_type(&mut self, custom_type: &'ast ast::TypedCustomType) {
+        let range = self.edits.src_span_to_lsp_range(custom_type.location);
+        if !overlaps(self.params.range, range) {
+            return;
+        }
+
+        let name = eco_format!("{}_decoder", custom_type.name.to_snake_case());
+
+        let Some(function_body) = (match custom_type.constructors.as_slice() {
+            // We can't generate a decoder for an external type
+            [] => return,
+            [constructor] => self.generate_decoder_for_variant(custom_type, constructor, 0),
+            constructors => {
+                let Some(cases) = constructors
+                    .iter()
+                    .map(|constructor| {
+                        self.generate_decoder_for_variant(custom_type, constructor, 4)
+                            .map(|body| {
+                                eco_format!(
+                                    r#"    "{name}" -> {body}"#,
+                                    name = constructor.name.to_snake_case()
+                                )
+                            })
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return;
+                };
+
+                let module = self.printer.print_module(DECODE_MODULE);
+                Some(eco_format!(
+                    r#"{{
+  use variant <- {module}.field("type", {module}.string)
+  case variant {{
+{cases}
+    _ -> {module}.failure(todo as "Zero value for {type_name}", "{type_name}")
+  }}
+}}"#,
+                    type_name = custom_type.name,
+                    cases = cases.join("\n")
+                ))
+            }
+        }) else {
+            return;
+        };
+
         let parameters = match custom_type.parameters.len() {
             0 => EcoString::new(),
             _ => eco_format!(
@@ -3088,16 +3099,18 @@ impl<'ast> ast::visit::Visit<'ast> for GenerateDynamicDecoder<'ast> {
             ),
         };
 
-        let function = format!(
-            "
+        let decoder_type = self.printer.print_type(&Type::Named {
+            publicity: ast::Publicity::Public,
+            package: STDLIB_PACKAGE_NAME.into(),
+            module: DECODE_MODULE.into(),
+            name: "Decoder".into(),
+            args: vec![],
+            inferred_variant: None,
+        });
 
-fn {name}() -> {decoder_type}({type_name}{parameters}) {{
-{decoders}
-  {decode_module}.success({constructor_name}({fields}:))
-}}",
+        let function = format!(
+            "\n\nfn {name}() -> {decoder_type}({type_name}{parameters}) {function_body}",
             type_name = custom_type.name,
-            constructor_name = constructor.name,
-            fields = field_names.join(":, ")
         );
 
         self.edits.insert(custom_type.end_position, function);
@@ -3171,7 +3184,7 @@ impl RecordLabel<'_> {
     fn variable_name(&self) -> EcoString {
         match self {
             RecordLabel::Labeled(label) => (*label).into(),
-            RecordLabel::Unlabeled(mut index) => {
+            &RecordLabel::Unlabeled(mut index) => {
                 let mut characters = Vec::new();
                 let alphabet_length = 26;
                 let alphabet_offset = b'a';
@@ -3212,58 +3225,71 @@ impl<'a> DecoderPrinter<'a> {
             eco_format!("{module_name}.int")
         } else if type_.is_string() {
             eco_format!("{module_name}.string")
-        } else if let Some(types) = type_.tuple_types() {
-            let fields = types
-                .iter()
-                .enumerate()
-                .map(|(index, type_)| RecordField {
-                    type_,
-                    label: RecordLabel::Unlabeled(index),
-                })
-                .collect_vec();
-            let decoders = fields
-                .iter()
-                .map(|field| self.decode_field(field, indent + 2))
-                .join("\n");
-            let mut field_names = fields.iter().map(|field| field.label.variable_name());
+        } else {
+            match type_.tuple_types() {
+                Some(types) => {
+                    let fields = types
+                        .iter()
+                        .enumerate()
+                        .map(|(index, type_)| RecordField {
+                            type_,
+                            label: RecordLabel::Unlabeled(index),
+                        })
+                        .collect_vec();
+                    let decoders = fields
+                        .iter()
+                        .map(|field| self.decode_field(field, indent + 2))
+                        .join("\n");
+                    let mut field_names = fields.iter().map(|field| field.label.variable_name());
 
-            eco_format!(
-                "{{
+                    eco_format!(
+                        "{{
 {decoders}
 
 {indent}  {module_name}.success(#({fields}))
 {indent}}}",
-                fields = field_names.join(", "),
-                indent = " ".repeat(indent)
-            )
-        } else {
-            let type_information = type_.named_type_information();
-            let type_information = type_information.as_ref().map(|(module, name, arguments)| {
-                (module.as_str(), name.as_str(), arguments.as_slice())
-            });
-
-            match type_information {
-                Some(("gleam/dynamic", "Dynamic", _)) => eco_format!("{module_name}.dynamic"),
-                Some(("gleam", "List", [element])) => {
-                    eco_format!("{module_name}.list({})", self.decoder_for(element, indent))
-                }
-                Some(("gleam/option", "Option", [some])) => {
-                    eco_format!("{module_name}.optional({})", self.decoder_for(some, indent))
-                }
-                Some(("gleam/dict", "Dict", [key, value])) => {
-                    eco_format!(
-                        "{module_name}.dict({}, {})",
-                        self.decoder_for(key, indent),
-                        self.decoder_for(value, indent)
+                        fields = field_names.join(", "),
+                        indent = " ".repeat(indent)
                     )
                 }
-                Some((module, name, _)) if module == self.type_module && name == self.type_name => {
-                    eco_format!("{}_decoder()", name.to_snake_case())
+                _ => {
+                    let type_information = type_.named_type_information();
+                    let type_information =
+                        type_information.as_ref().map(|(module, name, arguments)| {
+                            (module.as_str(), name.as_str(), arguments.as_slice())
+                        });
+
+                    match type_information {
+                        Some(("gleam/dynamic", "Dynamic", _)) => {
+                            eco_format!("{module_name}.dynamic")
+                        }
+                        Some(("gleam", "List", [element])) => {
+                            eco_format!("{module_name}.list({})", self.decoder_for(element, indent))
+                        }
+                        Some(("gleam/option", "Option", [some])) => {
+                            eco_format!(
+                                "{module_name}.optional({})",
+                                self.decoder_for(some, indent)
+                            )
+                        }
+                        Some(("gleam/dict", "Dict", [key, value])) => {
+                            eco_format!(
+                                "{module_name}.dict({}, {})",
+                                self.decoder_for(key, indent),
+                                self.decoder_for(value, indent)
+                            )
+                        }
+                        Some((module, name, _))
+                            if module == self.type_module && name == self.type_name =>
+                        {
+                            eco_format!("{}_decoder()", name.to_snake_case())
+                        }
+                        _ => eco_format!(
+                            r#"todo as "Decoder for {}""#,
+                            self.printer.print_type(type_)
+                        ),
+                    }
                 }
-                _ => eco_format!(
-                    r#"todo as "Decoder for {}""#,
-                    self.printer.print_type(type_)
-                ),
             }
         }
     }
@@ -3314,25 +3340,16 @@ impl<'a> GenerateJsonEncoder<'a> {
     pub fn code_actions(&mut self) {
         self.visit_typed_module(&self.module.ast);
     }
-}
 
-impl<'ast> ast::visit::Visit<'ast> for GenerateJsonEncoder<'ast> {
-    fn visit_typed_custom_type(&mut self, custom_type: &'ast ast::TypedCustomType) {
-        let range = self.edits.src_span_to_lsp_range(custom_type.location);
-        if !overlaps(self.params.range, range) {
-            return;
-        }
-
-        // For now, we only generate json encoders for types with one variant.
-        let constructor = match custom_type.constructors.as_slice() {
-            [constructor] => constructor,
-            _ => return,
-        };
-
-        let record_name = custom_type.name.to_snake_case();
-        let name = eco_format!("encode_{record_name}");
-
-        let Some(fields): Option<Vec<_>> = constructor
+    fn generate_encoder(
+        &mut self,
+        constructor: &'a TypedRecordConstructor,
+        type_name: EcoString,
+        record_name: EcoString,
+        variant_tag: Option<EcoString>,
+        indent: usize,
+    ) -> Option<EcoString> {
+        let fields = constructor
             .arguments
             .iter()
             .map(|argument| {
@@ -3343,21 +3360,77 @@ impl<'ast> ast::visit::Visit<'ast> for GenerateJsonEncoder<'ast> {
                     type_: &argument.type_,
                 })
             })
-            .collect()
-        else {
-            return;
-        };
+            .collect::<Option<Vec<_>>>()?;
 
-        let mut encoder_printer = EncoderPrinter::new(
-            &self.module.ast.names,
-            custom_type.name.clone(),
-            self.module.name.clone(),
-        );
+        let mut encoder_printer =
+            EncoderPrinter::new(&self.module.ast.names, type_name, self.module.name.clone());
 
         let encoders = fields
             .iter()
-            .map(|field| encoder_printer.encode_field(&record_name, field, 4))
+            .map(|field| encoder_printer.encode_field(&record_name, field, indent + 2))
             .join(",\n");
+
+        let indent = " ".repeat(indent);
+        let json_module = self.printer.print_module(JSON_MODULE);
+
+        Some(eco_format!(
+            "{json_module}.object([{tag}
+{encoders},
+{indent}])",
+            tag = variant_tag
+                .map(|tag| eco_format!("\n{indent}  #(\"type\", {json_module}.string(\"{tag}\")),"))
+                .unwrap_or_default()
+        ))
+    }
+}
+
+impl<'ast> ast::visit::Visit<'ast> for GenerateJsonEncoder<'ast> {
+    fn visit_typed_custom_type(&mut self, custom_type: &'ast ast::TypedCustomType) {
+        let range = self.edits.src_span_to_lsp_range(custom_type.location);
+        if !overlaps(self.params.range, range) {
+            return;
+        }
+        let record_name: EcoString = custom_type.name.to_snake_case().into();
+
+        let Some(encoder) = (match custom_type.constructors.as_slice() {
+            // We can't generate an encoder for an external type
+            [] => return,
+            [constructor] => self.generate_encoder(
+                constructor,
+                custom_type.name.clone(),
+                record_name.clone(),
+                None,
+                2,
+            ),
+            constructors => constructors
+                .iter()
+                .map(|constructor| {
+                    Some(eco_format!(
+                        "    {name}(..) -> {encoder}",
+                        name = constructor.name,
+                        encoder = self.generate_encoder(
+                            constructor,
+                            custom_type.name.clone(),
+                            record_name.clone(),
+                            Some(constructor.name.to_snake_case().into()),
+                            4
+                        )?
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(|cases| {
+                    eco_format!(
+                        "case {record_name} {{
+{cases}
+  }}",
+                        cases = cases.join("\n")
+                    )
+                }),
+        }) else {
+            return;
+        };
+
+        let name = eco_format!("encode_{record_name}");
 
         let json_type = self.printer.print_type(&Type::Named {
             publicity: ast::Publicity::Public,
@@ -3367,7 +3440,7 @@ impl<'ast> ast::visit::Visit<'ast> for GenerateJsonEncoder<'ast> {
             args: vec![],
             inferred_variant: None,
         });
-        let json_module = self.printer.print_module(JSON_MODULE);
+
         let parameters = match custom_type.parameters.len() {
             0 => EcoString::new(),
             _ => eco_format!(
@@ -3384,9 +3457,7 @@ impl<'ast> ast::visit::Visit<'ast> for GenerateJsonEncoder<'ast> {
             "
 
 fn {name}({record_name}: {type_name}{parameters}) -> {json_type} {{
-  {json_module}.object([
-{encoders},
-  ])
+  {encoder}
 }}",
             type_name = custom_type.name,
         );
@@ -3444,94 +3515,102 @@ impl<'a> EncoderPrinter<'a> {
             maybe_capture(eco_format!("{module_name}.int"))
         } else if type_.is_string() {
             maybe_capture(eco_format!("{module_name}.string"))
-        } else if let Some(types) = type_.tuple_types() {
-            let (tuple, new_indent) = if is_capture {
-                ("value", indent + 4)
-            } else {
-                (encoded_value, indent + 2)
-            };
+        } else {
+            match type_.tuple_types() {
+                Some(types) => {
+                    let (tuple, new_indent) = if is_capture {
+                        ("value", indent + 4)
+                    } else {
+                        (encoded_value, indent + 2)
+                    };
 
-            let encoders = types
-                .iter()
-                .enumerate()
-                .map(|(index, type_)| {
-                    self.encoder_for(&format!("{tuple}.{index}"), type_, new_indent)
-                })
-                .collect_vec();
+                    let encoders = types
+                        .iter()
+                        .enumerate()
+                        .map(|(index, type_)| {
+                            self.encoder_for(&format!("{tuple}.{index}"), type_, new_indent)
+                        })
+                        .collect_vec();
 
-            if is_capture {
-                eco_format!(
-                    "fn(value) {{
+                    if is_capture {
+                        eco_format!(
+                            "fn(value) {{
 {indent}  {module_name}.preprocessed_array([
 {indent}    {encoders},
 {indent}  ])
 {indent}}}",
-                    indent = " ".repeat(indent),
-                    encoders = encoders.join(&format!(",\n{}", " ".repeat(new_indent))),
-                )
-            } else {
-                eco_format!(
-                    "{module_name}.preprocessed_array([
+                            indent = " ".repeat(indent),
+                            encoders = encoders.join(&format!(",\n{}", " ".repeat(new_indent))),
+                        )
+                    } else {
+                        eco_format!(
+                            "{module_name}.preprocessed_array([
 {indent}  {encoders},
 {indent}])",
-                    indent = " ".repeat(indent),
-                    encoders = encoders.join(&format!(",\n{}", " ".repeat(new_indent))),
-                )
-            }
-        } else {
-            let type_information = type_.named_type_information();
-            let type_information: Option<(&str, &str, &[Arc<Type>])> =
-                type_information.as_ref().map(|(module, name, arguments)| {
-                    (module.as_str(), name.as_str(), arguments.as_slice())
-                });
-
-            match type_information {
-                Some(("gleam", "List", [element])) => {
-                    eco_format!(
-                        "{module_name}.array({encoded_value}, {map_function})",
-                        map_function = self.encoder_for("_", element, indent)
-                    )
+                            indent = " ".repeat(indent),
+                            encoders = encoders.join(&format!(",\n{}", " ".repeat(new_indent))),
+                        )
+                    }
                 }
-                Some(("gleam/option", "Option", [some])) => {
-                    eco_format!(
-                        "case {encoded_value} {{
+                _ => {
+                    let type_information = type_.named_type_information();
+                    let type_information: Option<(&str, &str, &[Arc<Type>])> =
+                        type_information.as_ref().map(|(module, name, arguments)| {
+                            (module.as_str(), name.as_str(), arguments.as_slice())
+                        });
+
+                    match type_information {
+                        Some(("gleam", "List", [element])) => {
+                            eco_format!(
+                                "{module_name}.array({encoded_value}, {map_function})",
+                                map_function = self.encoder_for("_", element, indent)
+                            )
+                        }
+                        Some(("gleam/option", "Option", [some])) => {
+                            eco_format!(
+                                "case {encoded_value} {{
 {indent}  {none} -> {module_name}.null()
 {indent}  {some}(value) -> {encoder}
 {indent}}}",
-                        indent = " ".repeat(indent),
-                        none = self
-                            .printer
-                            .print_constructor(&"gleam/option".into(), &"None".into()),
-                        some = self
-                            .printer
-                            .print_constructor(&"gleam/option".into(), &"Some".into()),
-                        encoder = self.encoder_for("value", some, indent + 2)
-                    )
-                }
-                Some(("gleam/dict", "Dict", [key, value])) => {
-                    let stringify_function = match key.named_type_information().as_ref().map(
-                        |(module, name, arguments)| {
-                            (module.as_str(), name.as_str(), arguments.as_slice())
-                        },
-                    ) {
-                        Some(("gleam", "String", [])) => "fn(string) { string }",
-                        _ => &format!(
-                            r#"todo as "Function to stringify {}""#,
-                            self.printer.print_type(key)
+                                indent = " ".repeat(indent),
+                                none = self
+                                    .printer
+                                    .print_constructor(&"gleam/option".into(), &"None".into()),
+                                some = self
+                                    .printer
+                                    .print_constructor(&"gleam/option".into(), &"Some".into()),
+                                encoder = self.encoder_for("value", some, indent + 2)
+                            )
+                        }
+                        Some(("gleam/dict", "Dict", [key, value])) => {
+                            let stringify_function = match key
+                                .named_type_information()
+                                .as_ref()
+                                .map(|(module, name, arguments)| {
+                                    (module.as_str(), name.as_str(), arguments.as_slice())
+                                }) {
+                                Some(("gleam", "String", [])) => "fn(string) { string }",
+                                _ => &format!(
+                                    r#"todo as "Function to stringify {}""#,
+                                    self.printer.print_type(key)
+                                ),
+                            };
+                            eco_format!(
+                                "{module_name}.dict({encoded_value}, {stringify_function}, {})",
+                                self.encoder_for("_", value, indent)
+                            )
+                        }
+                        Some((module, name, _))
+                            if module == self.type_module && name == self.type_name =>
+                        {
+                            maybe_capture(eco_format!("encode_{}", name.to_snake_case()))
+                        }
+                        _ => eco_format!(
+                            r#"todo as "Encoder for {}""#,
+                            self.printer.print_type(type_)
                         ),
-                    };
-                    eco_format!(
-                        "{module_name}.dict({encoded_value}, {stringify_function}, {})",
-                        self.encoder_for("_", value, indent)
-                    )
+                    }
                 }
-                Some((module, name, _)) if module == self.type_module && name == self.type_name => {
-                    maybe_capture(eco_format!("encode_{}", name.to_snake_case()))
-                }
-                _ => eco_format!(
-                    r#"todo as "Encoder for {}""#,
-                    self.printer.print_type(type_)
-                ),
             }
         }
     }
@@ -3772,8 +3851,8 @@ where
     }
 
     /// Will produce a pattern that can be used on the left hand side of a let
-    /// assignment to destructure a value of the given type. For example given this
-    /// type:
+    /// assignment to destructure a value of the given type. For example given
+    /// this type:
     ///
     /// ```gleam
     /// pub type Wibble {
@@ -3785,10 +3864,9 @@ where
     /// The pattern will use the correct qualified/unqualified name for the
     /// constructor if it comes from another package.
     ///
-    /// Be careful how:
-    /// - If the type is internal this function will return `None`.
-    /// - If the type has multiple constructors, it won't be safe to use
-    ///   in a let binding and this function will return `None`.
+    /// The function will only produce a list of patterns that can be used from
+    /// the current module. So if the type comes from another module it must be
+    /// public! Otherwise this function will return an empty vec.
     ///
     fn type_to_destructure_patterns(&mut self, type_: &Type) -> Option<Vec1<EcoString>> {
         match type_ {
@@ -4016,15 +4094,31 @@ fn get_type_constructors<'a, 'b, IO>(
 where
     IO: CommandExecutor + FileSystemWriter + FileSystemReader + BeamCompiler + Clone,
 {
-    let Some(module_interface) = compiler.get_module_interface(type_module) else {
+    let type_is_inside_current_module = current_module == type_module;
+    let module_interface = if !type_is_inside_current_module {
+        // If the type is outside of the module we're in, we can only pattern
+        // match on it if the module can be imported.
+        // The `get_module_interface` already takes care of making this check.
+        compiler.get_module_interface(type_module)
+    } else {
+        // However, if the type is defined in the module we're in, we can always
+        // pattern match on it. So we get the current module's interface.
+        compiler
+            .modules
+            .get(current_module)
+            .map(|module| &module.ast.type_info)
+    };
+
+    let Some(module_interface) = module_interface else {
         return vec![];
     };
+
     // If the type is in an internal module that is not the current one, we
     // cannot use its constructors!
-    let outside_of_current_module = *current_module != module_interface.name;
-    if outside_of_current_module && module_interface.is_internal {
+    if !type_is_inside_current_module && module_interface.is_internal {
         return vec![];
     }
+
     let Some(constructors) = module_interface.types_value_constructors.get(type_name) else {
         return vec![];
     };
@@ -4033,12 +4127,8 @@ where
         .variants
         .iter()
         .filter_map(|variant| {
-            let constructor = module_interface.get_public_value(&variant.name)?;
-            if constructor.publicity.is_public() {
-                Some(constructor)
-            } else if constructor.publicity.is_internal() && !outside_of_current_module {
-                // An internal constructor can only be used from within its own
-                // module, otherwise we don't suggest any action.
+            let constructor = module_interface.values.get(&variant.name)?;
+            if type_is_inside_current_module || constructor.publicity.is_public() {
                 Some(constructor)
             } else {
                 None
@@ -4103,7 +4193,7 @@ pub struct GenerateFunction<'a> {
 
 struct FunctionToGenerate<'a> {
     name: &'a str,
-    arguments_types: Vec<Arc<Type>>,
+    arguments: Vec<(Option<EcoString>, Arc<Type>)>,
     return_type: Arc<Type>,
     previous_function_end: Option<u32>,
 }
@@ -4128,7 +4218,7 @@ impl<'a> GenerateFunction<'a> {
 
         let Some(FunctionToGenerate {
             name,
-            arguments_types,
+            arguments,
             previous_function_end: Some(insert_at),
             return_type,
         }) = self.function_to_generate
@@ -4138,18 +4228,19 @@ impl<'a> GenerateFunction<'a> {
 
         let mut name_generator = NameGenerator::new();
         let mut printer = Printer::new(&self.module.ast.names);
-        let args = if let [arg_type] = arguments_types.as_slice() {
-            let arg_name = name_generator.generate_name_from_type(arg_type);
-            format!("{arg_name}: {}", printer.print_type(arg_type))
-        } else {
-            arguments_types
-                .iter()
-                .map(|arg_type| {
-                    let arg_name = name_generator.generate_name_from_type(arg_type);
-                    format!("{arg_name}: {}", printer.print_type(arg_type))
-                })
-                .join(", ")
-        };
+        let args = arguments
+            .iter()
+            .map(|(arg_label, arg_type)| {
+                let arg_name = name_generator.generate_name_from_type(arg_type);
+                let pretty_type = printer.print_type(arg_type);
+                if let Some(arg_label) = arg_label {
+                    format!("{arg_label} {arg_name}: {pretty_type}")
+                } else {
+                    format!("{arg_name}: {pretty_type}")
+                }
+            })
+            .join(", ");
+
         let return_type = printer.print_type(&return_type);
 
         self.edits.insert(
@@ -4165,6 +4256,34 @@ impl<'a> GenerateFunction<'a> {
             .push_to(&mut action);
         action
     }
+
+    fn try_save_function_to_generate(
+        &mut self,
+        function_name_location: SrcSpan,
+        function_type: &Arc<Type>,
+        labels: HashMap<usize, EcoString>,
+    ) {
+        let name_range = function_name_location.start as usize..function_name_location.end as usize;
+        let candidate_name = self.module.code.get(name_range);
+        match (candidate_name, function_type.fn_types()) {
+            (None, _) | (_, None) => (),
+            (Some(name), _) if !is_valid_lowercase_name(name) => (),
+            (Some(name), Some((arguments_types, return_type))) => {
+                let arguments = arguments_types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, arg)| (labels.get(&i).cloned(), arg.clone()))
+                    .collect_vec();
+
+                self.function_to_generate = Some(FunctionToGenerate {
+                    name,
+                    arguments,
+                    return_type,
+                    previous_function_end: self.last_visited_function_end,
+                })
+            }
+        }
+    }
 }
 
 impl<'ast> ast::visit::Visit<'ast> for GenerateFunction<'ast> {
@@ -4176,24 +4295,62 @@ impl<'ast> ast::visit::Visit<'ast> for GenerateFunction<'ast> {
     fn visit_typed_expr_invalid(&mut self, location: &'ast SrcSpan, type_: &'ast Arc<Type>) {
         let invalid_range = self.edits.src_span_to_lsp_range(*location);
         if within(self.params.range, invalid_range) {
-            let name_range = location.start as usize..location.end as usize;
-            let candidate_name = self.module.code.get(name_range);
-            match (candidate_name, type_.fn_types()) {
-                (None, _) | (_, None) => return,
-                (Some(name), _) if !is_valid_lowercase_name(name) => return,
-                (Some(name), Some((arguments_types, return_type))) => {
-                    self.function_to_generate = Some(FunctionToGenerate {
-                        name,
-                        arguments_types,
-                        return_type,
-                        previous_function_end: self.last_visited_function_end,
-                    })
-                }
-            }
+            self.try_save_function_to_generate(*location, type_, HashMap::new());
         }
 
         ast::visit::visit_typed_expr_invalid(self, location, type_);
     }
+
+    fn visit_typed_expr_call(
+        &mut self,
+        location: &'ast SrcSpan,
+        type_: &'ast Arc<Type>,
+        fun: &'ast TypedExpr,
+        args: &'ast [TypedCallArg],
+    ) {
+        // If the function being called is invalid we need to generate a
+        // function that has the proper labels.
+        let fun_range = self.edits.src_span_to_lsp_range(fun.location());
+
+        if within(self.params.range, fun_range) && fun.is_invalid() {
+            if labels_are_correct(args) {
+                let labels = args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, arg)| arg.label.as_ref().map(|label| (i, label.clone())))
+                    .collect();
+
+                self.try_save_function_to_generate(fun.location(), &fun.type_(), labels);
+            }
+        } else {
+            ast::visit::visit_typed_expr_call(self, location, type_, fun, args);
+        }
+    }
+}
+
+#[must_use]
+/// Checks the labels in the given arguments are correct: that is there's no
+/// duplicate labels and all labelled arguments come after the unlabelled ones.
+fn labels_are_correct(args: &[TypedCallArg]) -> bool {
+    let mut labelled_arg_found = false;
+    let mut used_labels = HashSet::new();
+
+    for arg in args {
+        match &arg.label {
+            // Labels are invalid if there's duplicate ones or if an unlabelled
+            // argument comes after a labelled one.
+            Some(label) if used_labels.contains(label) => return false,
+            None if labelled_arg_found => return false,
+            // Otherwise we just add the label to the used ones.
+            Some(label) => {
+                labelled_arg_found = true;
+                let _ = used_labels.insert(label);
+            }
+            None => continue,
+        }
+    }
+
+    true
 }
 
 struct NameGenerator {
@@ -4393,6 +4550,13 @@ impl<'a> ConvertToFunctionCall<'a> {
             PipelineAssignmentKind::FirstArgument {
                 second_argument: None,
             } => self.edits.insert(call.end - 1, first_value_text),
+
+            // When the value is piped into an echo, to rewrite the pipeline we
+            // have to insert the value after the `echo` with no parentheses:
+            // `a |> echo` is rewritten as `echo a`.
+            PipelineAssignmentKind::Echo => {
+                self.edits.insert(call.end, format!(" {first_value_text}"))
+            }
         }
 
         let mut action = Vec::with_capacity(1);
@@ -4439,5 +4603,529 @@ impl<'ast> ast::visit::Visit<'ast> for ConvertToFunctionCall<'ast> {
                 finally_kind,
             );
         }
+    }
+}
+
+/// Builder for code action to inline a variable.
+///
+pub struct InlineVariable<'a> {
+    module: &'a Module,
+    params: &'a CodeActionParams,
+    edits: TextEdits<'a>,
+    actions: Vec<CodeAction>,
+}
+
+impl<'a> InlineVariable<'a> {
+    pub fn new(
+        module: &'a Module,
+        line_numbers: &'a LineNumbers,
+        params: &'a CodeActionParams,
+    ) -> Self {
+        Self {
+            module,
+            params,
+            edits: TextEdits::new(line_numbers),
+            actions: Vec::new(),
+        }
+    }
+
+    pub fn code_actions(mut self) -> Vec<CodeAction> {
+        self.visit_typed_module(&self.module.ast);
+
+        self.actions
+    }
+
+    fn maybe_inline(&mut self, location: SrcSpan) {
+        let variable_location =
+            match find_variable_references(&self.module.ast, location).as_slice() {
+                [only_reference] => *only_reference,
+                _ => return,
+            };
+
+        let Some(ast::Statement::Assignment(assignment)) =
+            self.module.ast.find_statement(location.start)
+        else {
+            return;
+        };
+
+        // If the assignment does not simple bind a variable, for example:
+        // ```gleam
+        // let #(first, second, third)
+        // io.println(first)
+        // //         ^ Inline here
+        // ```
+        // We can't inline it.
+        if !matches!(assignment.pattern, Pattern::Variable { .. }) {
+            return;
+        }
+
+        let value_location = assignment.value.location();
+        let value = self
+            .module
+            .code
+            .get(value_location.start as usize..value_location.end as usize)
+            .expect("Span is valid");
+
+        self.edits.replace(variable_location, value.into());
+
+        let mut location = assignment.location;
+
+        let chars = self.module.code.chars();
+        let mut chars = chars.skip(assignment.location.end as usize);
+        // Delete any whitespace after the removed statement
+        while chars.next().is_some_and(char::is_whitespace) {
+            location.end += 1;
+        }
+
+        self.edits.delete(location);
+
+        CodeActionBuilder::new("Inline variable")
+            .kind(CodeActionKind::REFACTOR_INLINE)
+            .changes(
+                self.params.text_document.uri.clone(),
+                std::mem::take(&mut self.edits.edits),
+            )
+            .preferred(false)
+            .push_to(&mut self.actions);
+    }
+}
+
+impl<'ast> ast::visit::Visit<'ast> for InlineVariable<'ast> {
+    fn visit_typed_expr_var(
+        &mut self,
+        location: &'ast SrcSpan,
+        constructor: &'ast ValueConstructor,
+        _name: &'ast EcoString,
+    ) {
+        let range = self.edits.src_span_to_lsp_range(*location);
+
+        if !overlaps(self.params.range, range) {
+            return;
+        }
+
+        let type_::ValueConstructorVariant::LocalVariable { location, .. } = &constructor.variant
+        else {
+            return;
+        };
+
+        self.maybe_inline(*location);
+    }
+
+    fn visit_typed_pattern_variable(
+        &mut self,
+        location: &'ast SrcSpan,
+        _name: &'ast EcoString,
+        _type: &'ast Arc<Type>,
+        _origin: &'ast VariableOrigin,
+    ) {
+        let range = self.edits.src_span_to_lsp_range(*location);
+
+        if !overlaps(self.params.range, range) {
+            return;
+        }
+
+        self.maybe_inline(*location);
+    }
+}
+
+/// Builder for the "convert to pipe" code action.
+///
+/// ```gleam
+/// pub fn main() {
+///   wibble(wobble, woo)
+///  //  ^ [convert to pipe]
+/// }
+/// ```
+///
+/// Will turn the code into the following pipeline:
+///
+/// ```gleam
+/// pub fn main() {
+///   wobble |> wibble(woo)
+/// }
+/// ```
+///
+pub struct ConvertToPipe<'a> {
+    module: &'a Module,
+    params: &'a CodeActionParams,
+    edits: TextEdits<'a>,
+    argument_to_pipe: Option<ConvertToPipeArg<'a>>,
+    /// this will be true if we're visiting the call on the right hand side of a
+    /// use expression. So we can skip it and not try to turn it into a
+    /// function.
+    visiting_use_call: bool,
+}
+
+/// Holds all the data needed by the "convert to pipe" code action to properly
+/// rewrite a call into a pipe. Here's what each span means:
+///
+/// ```gleam
+///    wibble(wobb|le, woo)
+/// // ^^^^^^^^^^^^^^^^^^^^ call
+/// // ^^^^^^ called
+/// //        ^^^^^^^ arg
+/// //                 ^^^ next arg
+/// ```
+///
+/// In this example `position` is 0, since the cursor is over the first
+/// argument.
+///
+pub struct ConvertToPipeArg<'a> {
+    /// The span of the called function.
+    called: SrcSpan,
+    /// The span of the entire function call.
+    call: SrcSpan,
+    /// The position (0-based) of the argument.
+    position: usize,
+    /// The argument we have to pipe.
+    arg: &'a TypedCallArg,
+    /// The span of the argument following the one we have to pipe, if there's
+    /// any.
+    next_arg: Option<SrcSpan>,
+}
+
+impl<'a> ConvertToPipe<'a> {
+    pub fn new(
+        module: &'a Module,
+        line_numbers: &'a LineNumbers,
+        params: &'a CodeActionParams,
+    ) -> Self {
+        Self {
+            module,
+            params,
+            edits: TextEdits::new(line_numbers),
+            visiting_use_call: false,
+            argument_to_pipe: None,
+        }
+    }
+
+    pub fn code_actions(mut self) -> Vec<CodeAction> {
+        self.visit_typed_module(&self.module.ast);
+
+        let Some(ConvertToPipeArg {
+            called,
+            call,
+            position,
+            arg,
+            next_arg,
+        }) = self.argument_to_pipe
+        else {
+            return vec![];
+        };
+
+        let arg_range = if arg.uses_label_shorthand() {
+            arg.location.start as usize..arg.location.end as usize - 1
+        } else if arg.label.is_some() {
+            let value = arg.value.location();
+            value.start as usize..value.end as usize
+        } else {
+            arg.location.start as usize..arg.location.end as usize
+        };
+
+        let arg_text = self.module.code.get(arg_range).expect("invalid srcspan");
+
+        match next_arg {
+            // When extracting an argument we never want to remove any explicit
+            // label that was written down, so in case it is labelled (be it a
+            // shorthand or not) we'll always replace the value with a `_`
+            _ if arg.uses_label_shorthand() => self.edits.insert(arg.location.end, " _".into()),
+            _ if arg.label.is_some() => self.edits.replace(arg.value.location(), "_".into()),
+
+            // Now we can deal with unlabelled arguments:
+            // If we're removing the first argument and there's other arguments
+            // after it, we need to delete the comma that was separating the
+            // two.
+            Some(next_arg) if position == 0 => self.edits.delete(SrcSpan {
+                start: arg.location.start,
+                end: next_arg.start,
+            }),
+            // Otherwise, if we're deleting the first argument and there's
+            // no other arguments following it, we remove the call's
+            // parentheses.
+            None if position == 0 => self.edits.delete(SrcSpan {
+                start: called.end,
+                end: call.end,
+            }),
+            // In all other cases we're piping something that is not the first
+            // argument so we just replace it with an `_`.
+            _ => self.edits.replace(arg.location, "_".into()),
+        };
+
+        // Finally we can add the argument that was removed as the first step
+        // of the newly defined pipeline.
+        self.edits.insert(call.start, format!("{arg_text} |> "));
+
+        let mut action = Vec::with_capacity(1);
+        CodeActionBuilder::new("Convert to pipe")
+            .kind(CodeActionKind::REFACTOR_REWRITE)
+            .changes(self.params.text_document.uri.clone(), self.edits.edits)
+            .preferred(false)
+            .push_to(&mut action);
+        action
+    }
+}
+
+impl<'ast> ast::visit::Visit<'ast> for ConvertToPipe<'ast> {
+    fn visit_typed_expr_call(
+        &mut self,
+        location: &'ast SrcSpan,
+        _type_: &'ast Arc<Type>,
+        fun: &'ast TypedExpr,
+        args: &'ast [TypedCallArg],
+    ) {
+        // If we're visiting the typed function produced by typing a use, we
+        // skip the thing itself and only visit its arguments and called
+        // function, that is the body of the use.
+        if self.visiting_use_call {
+            self.visiting_use_call = false;
+            ast::visit::visit_typed_expr(self, fun);
+            args.iter().for_each(|arg| visit_typed_call_arg(self, arg));
+            return;
+        }
+
+        // We only visit a call if the cursor is somewhere within its location,
+        // otherwise we skip it entirely.
+        let call_range = self.edits.src_span_to_lsp_range(*location);
+        if !within(self.params.range, call_range) {
+            return;
+        }
+
+        // If the cursor is over any of the arguments then we'll use that as
+        // the one to extract.
+        // Otherwise the cursor must be over the called function, in that case
+        // we extract the first argument (if there's one):
+        //
+        // ```gleam
+        //    wibble(wobble, woo)
+        // // ^^^^^^^^^^^^^ pipe the first argument if I'm here
+        // //                ^^^ pipe the second argument if I'm here
+        // ```
+        let argument_to_pipe = args
+            .iter()
+            .enumerate()
+            .find_map(|(position, arg)| {
+                let arg_range = self.edits.src_span_to_lsp_range(arg.location);
+                if within(self.params.range, arg_range) {
+                    Some((position, arg))
+                } else {
+                    None
+                }
+            })
+            .or_else(|| args.first().map(|arg| (0, arg)));
+
+        // If we're not hovering over any of the arguments _or_ there's no
+        // argument to extract at all we just return, there's nothing we can do
+        // on this call or any of its arguments (since we've determined the
+        // cursor is not over any of those).
+        let Some((position, arg)) = argument_to_pipe else {
+            return;
+        };
+
+        self.argument_to_pipe = Some(ConvertToPipeArg {
+            called: fun.location(),
+            call: *location,
+            position,
+            arg,
+            next_arg: args.get(position + 1).map(|arg| arg.location),
+        })
+    }
+
+    fn visit_typed_expr_pipeline(
+        &mut self,
+        _location: &'ast SrcSpan,
+        first_value: &'ast TypedPipelineAssignment,
+        _assignments: &'ast [(TypedPipelineAssignment, PipelineAssignmentKind)],
+        _finally: &'ast TypedExpr,
+        _finally_kind: &'ast PipelineAssignmentKind,
+    ) {
+        // We can only apply the action on the first step of a pipeline, so we
+        // visit just that one and skip all the others.
+        ast::visit::visit_typed_pipeline_assignment(self, first_value);
+    }
+
+    fn visit_typed_use(&mut self, use_: &'ast TypedUse) {
+        self.visiting_use_call = true;
+        ast::visit::visit_typed_use(self, use_);
+    }
+}
+
+/// Code action to interpolate a string. If the cursor is inside the string
+/// (not selecting anything) the language server will offer to split it:
+///
+/// ```gleam
+/// "wibble | wobble"
+/// //      ^ [Split string]
+/// // Will produce the following
+/// "wibble " <> todo <> " wobble"
+/// ```
+///
+/// If the cursor is selecting an entire valid gleam name, then the language
+/// server will offer to interpolate it as a variable:
+///
+/// ```gleam
+/// "wibble wobble woo"
+/// //      ^^^^^^ [Interpolate variable]
+/// // Will produce the following
+/// "wibble " <> wobble <> " woo"
+/// ```
+///
+/// > Note: the cursor won't end up right after the inserted variable/todo.
+/// > that's a bit annoying, but in a future LSP version we will be able to
+/// > isnert tab stops to allow one to jump to the newly added variable/todo.
+///
+pub struct InterpolateString<'a> {
+    module: &'a Module,
+    params: &'a CodeActionParams,
+    edits: TextEdits<'a>,
+    string_interpolation: Option<(SrcSpan, StringInterpolation)>,
+    string_literal_position: StringLiteralPosition,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum StringLiteralPosition {
+    FirstPipelineStep,
+    Other,
+}
+
+#[derive(Clone, Copy)]
+enum StringInterpolation {
+    InterpolateValue { value_location: SrcSpan },
+    SplitString { split_at: u32 },
+}
+
+impl<'a> InterpolateString<'a> {
+    pub fn new(
+        module: &'a Module,
+        line_numbers: &'a LineNumbers,
+        params: &'a CodeActionParams,
+    ) -> Self {
+        Self {
+            module,
+            params,
+            edits: TextEdits::new(line_numbers),
+            string_interpolation: None,
+            string_literal_position: StringLiteralPosition::Other,
+        }
+    }
+
+    pub fn code_actions(mut self) -> Vec<CodeAction> {
+        self.visit_typed_module(&self.module.ast);
+
+        let Some((string_location, interpolation)) = self.string_interpolation else {
+            return vec![];
+        };
+
+        if self.string_literal_position == StringLiteralPosition::FirstPipelineStep {
+            self.edits.insert(string_location.start, "{ ".into());
+        }
+
+        match interpolation {
+            StringInterpolation::InterpolateValue { value_location } => {
+                let name = self
+                    .module
+                    .code
+                    .get(value_location.start as usize..value_location.end as usize)
+                    .expect("invalid value range");
+
+                if is_valid_lowercase_name(name) {
+                    self.edits
+                        .insert(value_location.start, format!("\" <> {name} <> \""));
+                    self.edits.delete(value_location);
+                } else if self.can_split_string_at(value_location.end) {
+                    // If the string is not a valid name we just try and split
+                    // the string at the end of the selection.
+                    self.edits
+                        .insert(value_location.end, "\" <> todo <> \"".into());
+                } else {
+                    // Otherwise there's no meaningful action we can do.
+                    return vec![];
+                }
+            }
+
+            StringInterpolation::SplitString { split_at } if self.can_split_string_at(split_at) => {
+                self.edits.insert(split_at, "\" <> todo <> \"".into());
+            }
+
+            StringInterpolation::SplitString { .. } => return vec![],
+        };
+
+        if self.string_literal_position == StringLiteralPosition::FirstPipelineStep {
+            self.edits.insert(string_location.end, " }".into());
+        }
+
+        let mut action = Vec::with_capacity(1);
+        CodeActionBuilder::new("Interpolate string")
+            .kind(CodeActionKind::REFACTOR_REWRITE)
+            .changes(self.params.text_document.uri.clone(), self.edits.edits)
+            .preferred(false)
+            .push_to(&mut action);
+        action
+    }
+
+    fn can_split_string_at(&self, at: u32) -> bool {
+        self.string_interpolation
+            .is_some_and(|(string_location, _)| {
+                !(at <= string_location.start + 1 || at >= string_location.end - 1)
+            })
+    }
+
+    fn visit_literal_string(
+        &mut self,
+        string_location: SrcSpan,
+        string_position: StringLiteralPosition,
+    ) {
+        // We can only interpolate/split a string if the cursor is somewhere
+        // within its location, otherwise we skip it.
+        let string_range = self.edits.src_span_to_lsp_range(string_location);
+        if !within(self.params.range, string_range) {
+            return;
+        }
+
+        let selection @ SrcSpan { start, end } =
+            self.edits.lsp_range_to_src_span(self.params.range);
+
+        let interpolation = if start == end {
+            StringInterpolation::SplitString { split_at: start }
+        } else {
+            StringInterpolation::InterpolateValue {
+                value_location: selection,
+            }
+        };
+        self.string_interpolation = Some((string_location, interpolation));
+        self.string_literal_position = string_position;
+    }
+}
+
+impl<'ast> ast::visit::Visit<'ast> for InterpolateString<'ast> {
+    fn visit_typed_expr_string(
+        &mut self,
+        location: &'ast SrcSpan,
+        _type_: &'ast Arc<Type>,
+        _value: &'ast EcoString,
+    ) {
+        self.visit_literal_string(*location, StringLiteralPosition::Other);
+    }
+
+    fn visit_typed_expr_pipeline(
+        &mut self,
+        _location: &'ast SrcSpan,
+        first_value: &'ast TypedPipelineAssignment,
+        assignments: &'ast [(TypedPipelineAssignment, PipelineAssignmentKind)],
+        finally: &'ast TypedExpr,
+        _finally_kind: &'ast PipelineAssignmentKind,
+    ) {
+        if first_value.value.is_literal_string() {
+            self.visit_literal_string(
+                first_value.location,
+                StringLiteralPosition::FirstPipelineStep,
+            );
+        } else {
+            ast::visit::visit_typed_pipeline_assignment(self, first_value);
+        }
+
+        assignments
+            .iter()
+            .for_each(|(a, _)| ast::visit::visit_typed_pipeline_assignment(self, a));
+        self.visit_typed_expr(finally);
     }
 }

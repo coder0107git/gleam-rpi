@@ -4,12 +4,12 @@ use crate::{
     ast::{
         Arg, Assignment, AssignmentKind, BinOp, BitArrayOption, BitArraySegment, CallArg, Clause,
         ClauseGuard, Constant, FunctionLiteralKind, HasLocation, ImplicitCallArgOrigin, Layer,
-        RecordBeingUpdated, SrcSpan, Statement, TodoKind, TypeAst, TypedArg, TypedAssignment,
-        TypedClause, TypedClauseGuard, TypedConstant, TypedExpr, TypedMultiPattern, TypedStatement,
-        UntypedArg, UntypedAssignment, UntypedClause, UntypedClauseGuard, UntypedConstant,
-        UntypedConstantBitArraySegment, UntypedExpr, UntypedExprBitArraySegment,
-        UntypedMultiPattern, UntypedStatement, UntypedUse, UntypedUseAssignment, Use,
-        UseAssignment, RECORD_UPDATE_VARIABLE, USE_ASSIGNMENT_VARIABLE,
+        RECORD_UPDATE_VARIABLE, RecordBeingUpdated, SrcSpan, Statement, TodoKind, TypeAst,
+        TypedArg, TypedAssignment, TypedClause, TypedClauseGuard, TypedConstant, TypedExpr,
+        TypedMultiPattern, TypedStatement, USE_ASSIGNMENT_VARIABLE, UntypedArg, UntypedAssignment,
+        UntypedClause, UntypedClauseGuard, UntypedConstant, UntypedConstantBitArraySegment,
+        UntypedExpr, UntypedExprBitArraySegment, UntypedMultiPattern, UntypedStatement, UntypedUse,
+        UntypedUseAssignment, Use, UseAssignment,
     },
     build::Target,
     exhaustiveness::{self, Reachability},
@@ -299,6 +299,11 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                 location, message, ..
             } => self.infer_panic(location, message),
 
+            UntypedExpr::Echo {
+                location,
+                expression,
+            } => self.infer_echo(location, expression),
+
             UntypedExpr::Var { location, name, .. } => self.infer_var(name, location),
 
             UntypedExpr::Int {
@@ -384,9 +389,10 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                 label_location,
                 label,
                 container,
-                ..
+                location,
             } => Ok(self.infer_field_access(
                 *container,
+                location,
                 label,
                 label_location,
                 FieldAccessUsage::Other,
@@ -479,6 +485,27 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             type_,
             message,
         })
+    }
+
+    fn infer_echo(
+        &mut self,
+        location: SrcSpan,
+        expression: Option<Box<UntypedExpr>>,
+    ) -> Result<TypedExpr, Error> {
+        self.environment.echo_found = true;
+        if let Some(expression) = expression {
+            let expression = self.infer(*expression)?;
+            if self.previous_panics {
+                self.warn_for_unreachable_code(location, PanicPosition::EchoExpression);
+            }
+            Ok(TypedExpr::Echo {
+                location,
+                type_: expression.type_(),
+                expression: Some(Box::new(expression)),
+            })
+        } else {
+            Err(Error::EchoWithNoFollowingExpression { location })
+        }
     }
 
     pub(crate) fn warn_for_unreachable_code(
@@ -975,7 +1002,22 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
     fn infer_field_access(
         &mut self,
         container: UntypedExpr,
+
+        // The SrcSpan of the entire field access:
+        // ```gleam
+        //    wibble.wobble
+        // // ^^^^^^^^^^^^^ This
+        // ```
+        //
+        location: SrcSpan,
         label: EcoString,
+
+        // The SrcSpan of the selection label:
+        // ```gleam
+        //    wibble.wobble
+        // // ^^^^^^ This
+        // ```
+        //
         label_location: SrcSpan,
         usage: FieldAccessUsage,
     ) -> TypedExpr {
@@ -1011,7 +1053,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             (_, Some((Err(module_access_err), false))) => {
                 self.problems.error(module_access_err);
                 TypedExpr::Invalid {
-                    location: label_location,
+                    location,
                     type_: self.new_unbound_var(),
                 }
             }
@@ -1030,7 +1072,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                         record: Box::new(record),
                     },
                     Err(_) => TypedExpr::Invalid {
-                        location: label_location,
+                        location,
                         type_: self.new_unbound_var(),
                     },
                 }
@@ -1171,6 +1213,40 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                 location: error.location,
             }
         })?;
+
+        // Track usage of the unaligned bit arrays feature on JavaScript so that
+        // warnings can be emitted if the Gleam version constraint is too low
+        if self.environment.target == Target::JavaScript
+            && !self.current_function_definition.has_javascript_external
+        {
+            for option in options.iter() {
+                if let BitArrayOption::<TypedValue>::Size {
+                    value, location, ..
+                } = option
+                {
+                    let mut using_unaligned_bit_array = false;
+
+                    if type_ == int() {
+                        match &(**value).as_int_literal() {
+                            Some(size) if size % 8 != 0 => {
+                                using_unaligned_bit_array = true;
+                            }
+                            _ => (),
+                        }
+                    } else if type_ == bits() {
+                        using_unaligned_bit_array = true;
+                    }
+
+                    if using_unaligned_bit_array {
+                        self.track_feature_usage(
+                            FeatureKind::JavaScriptUnalignedBitArray,
+                            *location,
+                        );
+                        break;
+                    }
+                }
+            }
+        }
 
         unify(type_.clone(), value.type_())
             .map_err(|e| convert_unify_error(e, value.location()))?;
@@ -1332,6 +1408,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
         let mut pattern_typer = pattern::PatternTyper::new(
             self.environment,
             &self.implementations,
+            &self.current_function_definition,
             &self.hydrator,
             self.problems,
         );
@@ -1606,6 +1683,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
         let mut pattern_typer = pattern::PatternTyper::new(
             self.environment,
             &self.implementations,
+            &self.current_function_definition,
             &self.hydrator,
             self.problems,
         );
@@ -1661,7 +1739,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
 
                     ValueConstructorVariant::ModuleConstant { literal, .. }
                     | ValueConstructorVariant::LocalConstant { literal } => {
-                        return Ok(ClauseGuard::Constant(literal.clone()))
+                        return Ok(ClauseGuard::Constant(literal.clone()));
                     }
                 };
 
@@ -2177,6 +2255,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             .and_then(|ma| match ma {
                 TypedExpr::ModuleSelect {
                     location,
+                    field_start: _,
                     type_,
                     label,
                     module_name,
@@ -2217,6 +2296,8 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
         module_location: &SrcSpan,
         select_location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
+        let location = module_location.merge(&select_location);
+
         let (module_name, constructor) = {
             let (_, module) = self
                 .environment
@@ -2235,10 +2316,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                     .get_public_value(&label)
                     .ok_or_else(|| Error::UnknownModuleValue {
                         name: label.clone(),
-                        location: SrcSpan {
-                            start: module_location.end,
-                            end: select_location.end,
-                        },
+                        location: select_location,
                         module_name: module.name.clone(),
                         value_constructors: module.public_value_names(),
                         type_with_same_name: module.get_public_type(&label).is_some(),
@@ -2280,9 +2358,10 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
         };
 
         Ok(TypedExpr::ModuleSelect {
+            location,
+            field_start: select_location.start,
             label,
             type_: Arc::clone(&type_),
-            location: select_location,
             module_name,
             module_alias: module_alias.clone(),
             constructor,
@@ -2516,32 +2595,37 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                         self.track_feature_usage(FeatureKind::LabelShorthandSyntax, *location);
                     }
 
-                    if let Some(index) = fields.remove(label) {
-                        unify(variant.arg_type(index), value.type_())
-                            .map_err(|e| convert_unify_error(e, *location))?;
+                    match fields.remove(label) {
+                        Some(index) => {
+                            unify(variant.arg_type(index), value.type_())
+                                .map_err(|e| convert_unify_error(e, *location))?;
 
-                        Ok((
-                            index,
-                            CallArg {
-                                label: Some(label.clone()),
-                                location: *location,
-                                value,
-                                implicit: None,
-                            },
-                        ))
-                    } else if variant.has_field(label) {
-                        Err(Error::DuplicateArgument {
-                            location: *location,
-                            label: label.clone(),
-                        })
-                    } else {
-                        Err(self.unknown_field_error(
-                            variant.field_names(),
-                            record_type.clone(),
-                            *location,
-                            label.clone(),
-                            FieldAccessUsage::RecordUpdate,
-                        ))
+                            Ok((
+                                index,
+                                CallArg {
+                                    label: Some(label.clone()),
+                                    location: *location,
+                                    value,
+                                    implicit: None,
+                                },
+                            ))
+                        }
+                        _ => {
+                            if variant.has_field(label) {
+                                Err(Error::DuplicateArgument {
+                                    location: *location,
+                                    label: label.clone(),
+                                })
+                            } else {
+                                Err(self.unknown_field_error(
+                                    variant.field_names(),
+                                    record_type.clone(),
+                                    *location,
+                                    label.clone(),
+                                    FieldAccessUsage::RecordUpdate,
+                                ))
+                            }
+                        }
                     }
                 },
             )
@@ -2622,7 +2706,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             _ => {
                 return Err(Error::RecordUpdateInvalidConstructor {
                     location: constructor.location(),
-                })
+                });
             }
         };
 
@@ -2650,7 +2734,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             _ => {
                 return Err(Error::RecordUpdateInvalidConstructor {
                     location: constructor.location(),
-                })
+                });
             }
         };
 
@@ -2932,13 +3016,13 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
 
                     ValueConstructorVariant::ModuleFn { .. }
                     | ValueConstructorVariant::LocalVariable { .. } => {
-                        return Err(Error::NonLocalClauseGuardVariable { location, name })
+                        return Err(Error::NonLocalClauseGuardVariable { location, name });
                     }
 
                     // TODO: remove this clone. Could use an rc instead
                     ValueConstructorVariant::ModuleConstant { literal, .. }
                     | ValueConstructorVariant::LocalConstant { literal } => {
-                        return Ok(literal.clone())
+                        return Ok(literal.clone());
                     }
                 };
 
@@ -2976,13 +3060,13 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
 
                     ValueConstructorVariant::ModuleFn { .. }
                     | ValueConstructorVariant::LocalVariable { .. } => {
-                        return Err(Error::NonLocalClauseGuardVariable { location, name })
+                        return Err(Error::NonLocalClauseGuardVariable { location, name });
                     }
 
                     // TODO: remove this clone. Could be an rc instead
                     ValueConstructorVariant::ModuleConstant { literal, .. }
                     | ValueConstructorVariant::LocalConstant { literal } => {
-                        return Ok(literal.clone())
+                        return Ok(literal.clone());
                     }
                 };
 
@@ -2992,7 +3076,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                 // TODO: resvisit this. It is rather awkward at present how we
                 // have to convert to this other data structure.
                 let fun = match &module {
-                    Some((module_alias, _)) => {
+                    Some((module_alias, module_location)) => {
                         let type_ = Arc::clone(&constructor.type_);
                         let module_name = self
                             .environment
@@ -3013,12 +3097,13 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                         };
 
                         TypedExpr::ModuleSelect {
+                            location: module_location.merge(&location),
+                            field_start: location.start,
                             label: name.clone(),
                             module_alias: module_alias.clone(),
                             module_name,
                             type_,
                             constructor: module_value_constructor,
-                            location,
                         }
                     }
 
@@ -3171,16 +3256,17 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
             // Type annotation and inferred value are valid. Ensure they are unifiable.
             // NOTE: if the types are not unifiable we use the annotated type.
             (Some(Ok(const_ann)), Ok(inferred)) => {
-                if let Err(e) = unify(const_ann.clone(), inferred.type_())
+                match unify(const_ann.clone(), inferred.type_())
                     .map_err(|e| convert_unify_error(e, inferred.location()))
                 {
-                    self.problems.error(e);
-                    Constant::Invalid {
-                        location: loc,
-                        type_: const_ann,
+                    Err(e) => {
+                        self.problems.error(e);
+                        Constant::Invalid {
+                            location: loc,
+                            type_: const_ann,
+                        }
                     }
-                } else {
-                    inferred
+                    _ => inferred,
                 }
             }
             // Type annotation is valid but not the inferred value. Place a placeholder constant with the annotation type.
@@ -3282,9 +3368,10 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                 label,
                 container,
                 label_location,
-                ..
+                location,
             } => Ok(self.infer_field_access(
                 *container,
+                location,
                 label,
                 label_location,
                 FieldAccessUsage::MethodCall,
@@ -3372,22 +3459,24 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
                 }
             });
         if let Err(e) = field_map {
-            if let Error::IncorrectArity {
-                expected,
-                given,
-                labels,
-                location,
-            } = e
-            {
-                labelled_arity_error = true;
-                self.problems.error(Error::IncorrectArity {
+            match e {
+                Error::IncorrectArity {
                     expected,
                     given,
                     labels,
                     location,
-                });
-            } else {
-                self.problems.error(e);
+                } => {
+                    labelled_arity_error = true;
+                    self.problems.error(Error::IncorrectArity {
+                        expected,
+                        given,
+                        labels,
+                        location,
+                    });
+                }
+                _ => {
+                    self.problems.error(e);
+                }
             }
         }
 

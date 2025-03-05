@@ -1,6 +1,6 @@
 use super::{
-    expression::{ArgumentKind, CallKind},
     FieldAccessUsage,
+    expression::{ArgumentKind, CallKind},
 };
 use crate::{
     ast::{BinOp, Layer, SrcSpan, TodoKind},
@@ -568,7 +568,7 @@ pub enum Error {
         name: EcoString,
     },
 
-    /// Occers when all the variant types of a custom type are deprecated
+    /// Occurs when all the variant types of a custom type are deprecated
     ///
     /// ```gleam
     /// type Wibble {
@@ -589,6 +589,20 @@ pub enum Error {
     },
 
     ErlangFloatUnsafe {
+        location: SrcSpan,
+    },
+
+    /// When the echo keyword is not followed by an expression to be printed.
+    /// The only place where echo is allowed to appear on its own is as a step
+    /// of a pipeline, otherwise omitting the expression will result in this
+    /// error. For example:
+    ///
+    /// ```gleam
+    /// call(echo, 1, 2)
+    /// //   ^^^^ Error!
+    /// ```
+    ///
+    EchoWithNoFollowingExpression {
         location: SrcSpan,
     },
 }
@@ -925,6 +939,7 @@ pub enum FeatureKind {
     RecordAccessVariantInference,
     LetAssertWithMessage,
     VariantWithDeprecatedAnnotation,
+    JavaScriptUnalignedBitArray,
 }
 
 impl FeatureKind {
@@ -950,6 +965,8 @@ impl FeatureKind {
             FeatureKind::VariantWithDeprecatedAnnotation | FeatureKind::LetAssertWithMessage => {
                 Version::new(1, 7, 0)
             }
+
+            FeatureKind::JavaScriptUnalignedBitArray => Version::new(1, 9, 0),
         }
     }
 }
@@ -962,6 +979,9 @@ pub enum PanicPosition {
     /// When the unreachable part is a function call, this means that its last
     /// argument must be a panic.
     LastFunctionArgument,
+
+    /// When the expression to be printed by echo panics.
+    EchoExpression,
 
     /// Any expression that doesn't fall in the previous two categories
     PreviousExpression,
@@ -1050,8 +1070,10 @@ impl Error {
             | Error::UseFnIncorrectArity { location, .. }
             | Error::BadName { location, .. }
             | Error::AllVariantsDeprecated { location }
+            | Error::EchoWithNoFollowingExpression { location }
             | Error::DeprecatedVariantOnDeprecatedType { location }
             | Error::ErlangFloatUnsafe { location } => location.start,
+
             Error::UnknownLabels { unknown, .. } => {
                 unknown.iter().map(|(_, s)| s.start).min().unwrap_or(0)
             }
