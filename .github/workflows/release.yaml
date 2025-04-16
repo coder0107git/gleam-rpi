@@ -23,9 +23,7 @@ jobs:
         target:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
-          - x86_64-pc-windows-msvc
+          - armv7-unknown-linux-gnueabihf
         toolchain: [ stable ]
         include:
           - os: ubuntu-latest
@@ -36,19 +34,10 @@ jobs:
             target: aarch64-unknown-linux-musl
             expected-binary-architecture: aarch64
             cargo-tool: cross
-          # macos>=14 runs exclusively on aarch64 and will thus fail to execute properly for x64
-          - os: macos-13
-            target: x86_64-apple-darwin
-            expected-binary-architecture: x86_64
-            cargo-tool: cargo
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            expected-binary-architecture: arm64
-            cargo-tool: cargo
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            expected-binary-architecture: x86-64
-            cargo-tool: cargo
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            expected-binary-architecture: armhf
+            cargo-tool: cross
           - os: ubuntu-latest
             target: wasm32-unknown-unknown
             cargo-tool: wasm-pack
