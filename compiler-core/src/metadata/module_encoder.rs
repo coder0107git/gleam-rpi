@@ -11,7 +11,7 @@ use crate::{
         self, AccessorsMap, Deprecation, FieldMap, Opaque, RecordAccessor, Type,
         TypeAliasConstructor, TypeConstructor, TypeValueConstructor, TypeVar,
         TypeVariantConstructors, ValueConstructor, ValueConstructorVariant,
-        expression::Implementations,
+        expression::{Implementations, Purity},
     },
 };
 use std::{collections::HashMap, ops::Deref, sync::Arc};
@@ -62,10 +62,20 @@ impl<'a> ModuleEncoder<'a> {
     fn set_line_numbers(&mut self, module: &mut module::Builder<'_>) {
         let mut line_numbers = module.reborrow().init_line_numbers();
         line_numbers.set_length(self.data.line_numbers.length);
-        let mut line_starts =
-            line_numbers.init_line_starts(self.data.line_numbers.line_starts.len() as u32);
+
+        let mut line_starts = line_numbers
+            .reborrow()
+            .init_line_starts(self.data.line_numbers.line_starts.len() as u32);
         for (i, l) in self.data.line_numbers.line_starts.iter().enumerate() {
             line_starts.reborrow().set(i as u32, *l);
+        }
+
+        let mut mapping = line_numbers.init_mapping(self.data.line_numbers.mapping.len() as u32);
+        for (i, (byte_index, character)) in self.data.line_numbers.mapping.iter().enumerate() {
+            let mut builder = mapping.reborrow().get(i as u32);
+            builder.set_byte_index(*byte_index as u64);
+            builder.set_length_utf8(character.length_utf8);
+            builder.set_length_utf16(character.length_utf16);
         }
     }
 
@@ -133,6 +143,7 @@ impl<'a> ModuleEncoder<'a> {
         self.build_type(builder.reborrow().init_type(), &accessor.type_);
         builder.reborrow().set_label(&accessor.label);
         builder.set_index(accessor.index as u16);
+        builder.set_documentation(accessor.documentation.as_deref().unwrap_or_default());
     }
 
     fn set_module_types(&mut self, module: &mut module::Builder<'_>) {
@@ -300,7 +311,12 @@ impl<'a> ModuleEncoder<'a> {
         self.build_type(type_builder, &constructor.type_);
         self.build_src_span(builder.reborrow().init_origin(), constructor.origin);
         builder.set_documentation(constructor.documentation.as_deref().unwrap_or_default());
-        builder.set_arity(constructor.arity as u32)
+        builder.set_arity(constructor.arity as u32);
+
+        let mut parameters_builder = builder.init_parameters(constructor.parameters.len() as u32);
+        for (index, parameter) in constructor.parameters.iter().enumerate() {
+            self.build_type(parameters_builder.reborrow().get(index as u32), parameter);
+        }
     }
 
     fn build_type_value_constructor(
@@ -326,6 +342,7 @@ impl<'a> ModuleEncoder<'a> {
     ) {
         self.build_type(builder.reborrow().init_type(), parameter.type_.as_ref());
         builder.set_label(parameter.label.as_deref().unwrap_or_default());
+        builder.set_documentation(parameter.documentation.as_deref().unwrap_or_default());
     }
 
     fn build_value_constructor(
@@ -430,12 +447,22 @@ impl<'a> ModuleEncoder<'a> {
                 implementations,
                 external_erlang,
                 external_javascript,
+                purity,
             } => {
                 let mut builder = builder.init_module_fn();
                 builder.set_name(name);
                 builder.set_module(module);
                 builder.set_arity(*arity as u16);
                 builder.set_documentation(doc.as_ref().map(EcoString::as_str).unwrap_or_default());
+
+                let mut purity_builder = builder.reborrow().init_purity();
+                match purity {
+                    Purity::Pure => purity_builder.set_pure(()),
+                    Purity::TrustedPure => purity_builder.set_trusted_pure(()),
+                    Purity::Impure => purity_builder.set_impure(()),
+                    Purity::Unknown => purity_builder.set_unknown(()),
+                }
+
                 self.build_external(builder.reborrow().init_external_erlang(), external_erlang);
                 self.build_external(
                     builder.reborrow().init_external_javascript(),
@@ -498,13 +525,16 @@ impl<'a> ModuleEncoder<'a> {
             }
 
             Constant::Record {
-                args, tag, type_, ..
+                arguments,
+                tag,
+                type_,
+                ..
             } => {
                 let mut builder = builder.init_record();
                 {
-                    let mut builder = builder.reborrow().init_args(args.len() as u32);
-                    for (i, arg) in args.iter().enumerate() {
-                        self.build_constant(builder.reborrow().get(i as u32), &arg.value);
+                    let mut builder = builder.reborrow().init_args(arguments.len() as u32);
+                    for (i, argument) in arguments.iter().enumerate() {
+                        self.build_constant(builder.reborrow().get(i as u32), &argument.value);
                     }
                 }
                 builder.reborrow().set_tag(tag);
@@ -612,19 +642,22 @@ impl<'a> ModuleEncoder<'a> {
 
     fn build_type(&mut self, builder: schema::type_::Builder<'_>, type_: &Type) {
         match type_ {
-            Type::Fn { args, return_ } => {
+            Type::Fn { arguments, return_ } => {
                 let mut fun = builder.init_fn();
-                self.build_types(fun.reborrow().init_arguments(args.len() as u32), args);
+                self.build_types(
+                    fun.reborrow().init_arguments(arguments.len() as u32),
+                    arguments,
+                );
                 self.build_type(fun.init_return(), return_)
             }
 
             Type::Named {
                 name,
-                args,
+                arguments,
                 module,
                 package,
                 inferred_variant,
-                ..
+                publicity,
             } => {
                 let mut app = builder.init_app();
                 app.set_name(name);
@@ -635,7 +668,11 @@ impl<'a> ModuleEncoder<'a> {
                     Some(variant) => variant_builder.set_inferred(*variant),
                     None => variant_builder.set_unknown(()),
                 }
-                self.build_types(app.reborrow().init_parameters(args.len() as u32), args);
+                self.build_types(
+                    app.reborrow().init_parameters(arguments.len() as u32),
+                    arguments,
+                );
+                self.build_publicity(app.init_publicity(), *publicity);
             }
 
             Type::Tuple { elements } => self.build_types(

@@ -2,21 +2,32 @@ use crate::{
     Error, Result, Warning,
     analyse::name::correct_name_case,
     ast::{
-        self, CustomType, Definition, DefinitionLocation, ModuleConstant, PatternUnusedArguments,
-        SrcSpan, TypedArg, TypedExpr, TypedFunction, TypedModule, TypedPattern,
+        self, Constant, CustomType, Definition, DefinitionLocation, ModuleConstant,
+        PatternUnusedArguments, SrcSpan, TypedArg, TypedConstant, TypedExpr, TypedFunction,
+        TypedModule, TypedPattern,
     },
-    build::{Located, Module, UnqualifiedImport, type_constructor_from_modules},
+    build::{
+        ExpressionPosition, Located, Module, UnqualifiedImport, type_constructor_from_modules,
+    },
     config::PackageConfig,
     io::{BeamCompiler, CommandExecutor, FileSystemReader, FileSystemWriter},
     language_server::{
-        compiler::LspProjectCompiler, files::FileSystemProxy, progress::ProgressReporter,
+        code_action::{
+            AddOmittedLabels, CollapseNestedCase, ExtractFunction, RemoveBlock,
+            RemovePrivateOpaque, RemoveUnreachableCaseClauses,
+        },
+        compiler::LspProjectCompiler,
+        files::FileSystemProxy,
+        progress::ProgressReporter,
+        reference::FindVariableReferences,
+        rename::RenameOutcome,
     },
     line_numbers::LineNumbers,
     paths::ProjectPaths,
     type_::{
         self, Deprecation, ModuleInterface, Type, TypeConstructor, ValueConstructor,
         ValueConstructorVariant,
-        error::{Named, VariableOrigin},
+        error::{Named, VariableSyntax},
         printer::Printer,
     },
 };
@@ -24,6 +35,7 @@ use camino::Utf8PathBuf;
 use ecow::EcoString;
 use itertools::Itertools;
 use lsp::CodeAction;
+use lsp_server::ResponseError;
 use lsp_types::{
     self as lsp, DocumentSymbol, Hover, HoverContents, MarkedString, Position,
     PrepareRenameResponse, Range, SignatureHelp, SymbolKind, SymbolTag, TextEdit, Url,
@@ -36,9 +48,10 @@ use super::{
     code_action::{
         AddAnnotations, CodeActionBuilder, ConvertFromUse, ConvertToFunctionCall, ConvertToPipe,
         ConvertToUse, ExpandFunctionCapture, ExtractConstant, ExtractVariable,
-        FillInMissingLabelledArgs, FillUnusedFields, FixBinaryOperation, GenerateDynamicDecoder,
-        GenerateFunction, GenerateJsonEncoder, InlineVariable, InterpolateString, LetAssertToCase,
-        PatternMatchOnValue, RedundantTupleInCaseSubject, RemoveEchos, UseLabelShorthandSyntax,
+        FillInMissingLabelledArgs, FillUnusedFields, FixBinaryOperation,
+        FixTruncatedBitArraySegment, GenerateDynamicDecoder, GenerateFunction, GenerateJsonEncoder,
+        GenerateVariant, InlineVariable, InterpolateString, LetAssertToCase, PatternMatchOnValue,
+        RedundantTupleInCaseSubject, RemoveEchos, RemoveUnusedImports, UseLabelShorthandSyntax,
         WrapInBlock, code_action_add_missing_patterns,
         code_action_convert_qualified_constructor_to_unqualified,
         code_action_convert_unqualified_constructor_to_qualified, code_action_import_module,
@@ -46,11 +59,9 @@ use super::{
     },
     completer::Completer,
     reference::{
-        Referenced, find_module_references, find_variable_references, reference_for_ast_node,
+        Referenced, VariableReferenceKind, find_module_references, reference_for_ast_node,
     },
-    rename::{
-        RenameTarget, Renamed, VariableRenameKind, rename_local_variable, rename_module_entity,
-    },
+    rename::{RenameTarget, Renamed, rename_local_variable, rename_module_entity},
     signature_help, src_span_to_lsp_range,
 };
 
@@ -262,9 +273,7 @@ where
             };
 
             let completer = Completer::new(&src, &params, &this.compiler, module);
-            let byte_index = completer
-                .module_line_numbers
-                .byte_index(params.position.line, params.position.character);
+            let byte_index = completer.module_line_numbers.byte_index(params.position);
 
             // If in comment context, do not provide completions
             if module.extra.is_within_comment(byte_index) {
@@ -286,20 +295,45 @@ where
                 Located::PatternSpread { .. } => None,
                 Located::Pattern(_pattern) => None,
                 // Do not show completions when typing inside a string.
-                Located::Expression(TypedExpr::String { .. }) => None,
-                Located::Expression(TypedExpr::Call { fun, args, .. }) => {
+                Located::Expression {
+                    expression: TypedExpr::String { .. },
+                    ..
+                }
+                | Located::Constant(Constant::String { .. }) => None,
+                Located::Expression {
+                    expression: TypedExpr::Call { fun, arguments, .. },
+                    ..
+                } => {
                     let mut completions = vec![];
                     completions.append(&mut completer.completion_values());
-                    completions.append(&mut completer.completion_labels(fun, args));
+                    completions.append(&mut completer.completion_labels(fun, arguments));
                     Some(completions)
                 }
-                Located::Expression(TypedExpr::RecordAccess { record, .. }) => {
+                Located::Expression {
+                    expression: TypedExpr::RecordAccess { record, .. },
+                    ..
+                } => {
                     let mut completions = vec![];
                     completions.append(&mut completer.completion_values());
                     completions.append(&mut completer.completion_field_accessors(record.type_()));
                     Some(completions)
                 }
-                Located::Statement(_) | Located::Expression(_) => {
+                Located::Expression {
+                    position:
+                        ExpressionPosition::ArgumentOrLabel {
+                            called_function,
+                            function_arguments,
+                        },
+                    ..
+                } => {
+                    let mut completions = vec![];
+                    completions.append(&mut completer.completion_values());
+                    completions.append(
+                        &mut completer.completion_labels(called_function, function_arguments),
+                    );
+                    Some(completions)
+                }
+                Located::Statement(_) | Located::Expression { .. } => {
                     Some(completer.completion_values())
                 }
                 Located::ModuleStatement(Definition::Function(_)) => {
@@ -320,7 +354,9 @@ where
                         completer.unqualified_completions_from_module(importing_module, true)
                     }),
 
-                Located::ModuleStatement(Definition::ModuleConstant(_)) => None,
+                Located::ModuleStatement(Definition::ModuleConstant(_)) | Located::Constant(_) => {
+                    Some(completer.completion_values())
+                }
 
                 Located::UnqualifiedImport(_) => None,
 
@@ -357,9 +393,10 @@ where
             let lines = LineNumbers::new(&module.code);
 
             code_action_unused_values(module, &lines, &params, &mut actions);
-            code_action_unused_imports(module, &lines, &params, &mut actions);
+            actions.extend(RemoveUnusedImports::new(module, &lines, &params).code_actions());
             code_action_convert_qualified_constructor_to_unqualified(
                 module,
+                &this.compiler,
                 &lines,
                 &params,
                 &mut actions,
@@ -373,6 +410,9 @@ where
             code_action_fix_names(&lines, &params, &this.error, &mut actions);
             code_action_import_module(module, &lines, &params, &this.error, &mut actions);
             code_action_add_missing_patterns(module, &lines, &params, &this.error, &mut actions);
+            actions
+                .extend(RemoveUnreachableCaseClauses::new(module, &lines, &params).code_actions());
+            actions.extend(CollapseNestedCase::new(module, &lines, &params).code_actions());
             code_action_inexhaustive_let_to_case(
                 module,
                 &lines,
@@ -381,6 +421,8 @@ where
                 &mut actions,
             );
             actions.extend(FixBinaryOperation::new(module, &lines, &params).code_actions());
+            actions
+                .extend(FixTruncatedBitArraySegment::new(module, &lines, &params).code_actions());
             actions.extend(LetAssertToCase::new(module, &lines, &params).code_actions());
             actions
                 .extend(RedundantTupleInCaseSubject::new(module, &lines, &params).code_actions());
@@ -394,14 +436,24 @@ where
             actions.extend(InterpolateString::new(module, &lines, &params).code_actions());
             actions.extend(ExtractVariable::new(module, &lines, &params).code_actions());
             actions.extend(ExtractConstant::new(module, &lines, &params).code_actions());
-            actions.extend(GenerateFunction::new(module, &lines, &params).code_actions());
+            actions.extend(
+                GenerateFunction::new(module, &this.compiler.modules, &lines, &params)
+                    .code_actions(),
+            );
+            actions.extend(
+                GenerateVariant::new(module, &this.compiler, &lines, &params).code_actions(),
+            );
             actions.extend(ConvertToPipe::new(module, &lines, &params).code_actions());
             actions.extend(ConvertToFunctionCall::new(module, &lines, &params).code_actions());
             actions.extend(
                 PatternMatchOnValue::new(module, &lines, &params, &this.compiler).code_actions(),
             );
+            actions.extend(AddOmittedLabels::new(module, &lines, &params).code_actions());
             actions.extend(InlineVariable::new(module, &lines, &params).code_actions());
             actions.extend(WrapInBlock::new(module, &lines, &params).code_actions());
+            actions.extend(RemoveBlock::new(module, &lines, &params).code_actions());
+            actions.extend(RemovePrivateOpaque::new(module, &lines, &params).code_actions());
+            actions.extend(ExtractFunction::new(module, &lines, &params).code_actions());
             GenerateDynamicDecoder::new(module, &lines, &params, &mut actions).code_actions();
             GenerateJsonEncoder::new(
                 module,
@@ -599,19 +651,24 @@ where
                 )))
             };
 
-            let byte_index = lines.byte_index(params.position.line, params.position.character);
+            let byte_index = lines.byte_index(params.position);
 
             Ok(match reference_for_ast_node(found, &current_module.name) {
                 Some(Referenced::LocalVariable {
                     location, origin, ..
-                }) if location.contains(byte_index) => match origin {
-                    Some(VariableOrigin::Generated) => None,
+                }) if location.contains(byte_index) => match origin.map(|origin| origin.syntax) {
+                    Some(VariableSyntax::Generated) => None,
                     Some(
-                        VariableOrigin::Variable(_)
-                        | VariableOrigin::AssignmentPattern
-                        | VariableOrigin::LabelShorthand(_),
-                    )
-                    | None => success_response(location),
+                        VariableSyntax::Variable(label) | VariableSyntax::LabelShorthand(label),
+                    ) => success_response(SrcSpan {
+                        start: location.start,
+                        end: label
+                            .len()
+                            .try_into()
+                            .map(|len: u32| location.start + len)
+                            .unwrap_or(location.end),
+                    }),
+                    Some(VariableSyntax::AssignmentPattern) | None => success_response(location),
                 },
                 Some(
                     Referenced::ModuleValue {
@@ -643,34 +700,50 @@ where
         })
     }
 
-    pub fn rename(&mut self, params: lsp::RenameParams) -> Response<Option<WorkspaceEdit>> {
+    pub fn rename(
+        &mut self,
+        params: lsp::RenameParams,
+    ) -> Response<Result<Option<WorkspaceEdit>, ResponseError>> {
         self.respond(|this| {
             let position = &params.text_document_position;
 
             let (lines, found) = match this.node_at_position(position) {
                 Some(value) => value,
-                None => return Ok(None),
+                None => return Ok(RenameOutcome::NoRenames.into_result()),
             };
 
             let Some(module) = this.module_for_uri(&position.text_document.uri) else {
-                return Ok(None);
+                return Ok(RenameOutcome::NoRenames.into_result());
             };
 
             Ok(match reference_for_ast_node(found, &module.name) {
                 Some(Referenced::LocalVariable {
                     origin,
                     definition_location,
+                    name,
                     ..
                 }) => {
-                    let rename_kind = match origin {
-                        Some(VariableOrigin::Generated) => return Ok(None),
-                        Some(VariableOrigin::LabelShorthand(_)) => {
-                            VariableRenameKind::LabelShorthand
+                    let rename_kind = match origin.map(|origin| origin.syntax) {
+                        Some(VariableSyntax::Generated) => {
+                            return Ok(RenameOutcome::NoRenames.into_result());
                         }
-                        Some(VariableOrigin::AssignmentPattern | VariableOrigin::Variable(_))
-                        | None => VariableRenameKind::Variable,
+                        Some(VariableSyntax::LabelShorthand(_)) => {
+                            VariableReferenceKind::LabelShorthand
+                        }
+                        Some(
+                            VariableSyntax::AssignmentPattern | VariableSyntax::Variable { .. },
+                        )
+                        | None => VariableReferenceKind::Variable,
                     };
-                    rename_local_variable(module, &lines, &params, definition_location, rename_kind)
+                    rename_local_variable(
+                        module,
+                        &lines,
+                        &params,
+                        definition_location,
+                        name,
+                        rename_kind,
+                    )
+                    .into_result()
                 }
                 Some(Referenced::ModuleValue {
                     module: module_name,
@@ -690,7 +763,9 @@ where
                         target_kind,
                         layer: ast::Layer::Value,
                     },
-                ),
+                )
+                .into_result(),
+
                 Some(Referenced::ModuleType {
                     module: module_name,
                     target_kind,
@@ -708,8 +783,10 @@ where
                         target_kind,
                         layer: ast::Layer::Type,
                     },
-                ),
-                None => None,
+                )
+                .into_result(),
+
+                None => RenameOutcome::NoRenames.into_result(),
             })
         })
     }
@@ -732,30 +809,42 @@ where
                 return Ok(None);
             };
 
-            let byte_index = lines.byte_index(position.position.line, position.position.character);
+            let byte_index = lines.byte_index(position.position);
 
             Ok(match reference_for_ast_node(found, &module.name) {
                 Some(Referenced::LocalVariable {
                     origin,
                     definition_location,
                     location,
-                }) if location.contains(byte_index) => match origin {
-                    Some(VariableOrigin::Generated) => None,
+                    name,
+                }) if location.contains(byte_index) => match origin.map(|origin| origin.syntax) {
+                    Some(VariableSyntax::Generated) => None,
                     Some(
-                        VariableOrigin::LabelShorthand(_)
-                        | VariableOrigin::AssignmentPattern
-                        | VariableOrigin::Variable(_),
+                        VariableSyntax::LabelShorthand(_)
+                        | VariableSyntax::AssignmentPattern
+                        | VariableSyntax::Variable { .. },
                     )
-                    | None => Some(
-                        find_variable_references(&module.ast, definition_location)
-                            .into_iter()
-                            .chain(std::iter::once(definition_location))
-                            .map(|location| lsp::Location {
+                    | None => {
+                        let variable_references =
+                            FindVariableReferences::new(definition_location, name)
+                                .find_in_module(&module.ast);
+
+                        let mut reference_locations =
+                            Vec::with_capacity(variable_references.len() + 1);
+                        reference_locations.push(lsp::Location {
+                            uri: uri.clone(),
+                            range: src_span_to_lsp_range(definition_location, &lines),
+                        });
+
+                        for reference in variable_references {
+                            reference_locations.push(lsp::Location {
                                 uri: uri.clone(),
-                                range: src_span_to_lsp_range(location, &lines),
+                                range: src_span_to_lsp_range(reference.location, &lines),
                             })
-                            .collect(),
-                    ),
+                        }
+
+                        Some(reference_locations)
+                    }
                 },
                 Some(Referenced::ModuleValue {
                     module,
@@ -825,6 +914,7 @@ where
                 Located::ModuleStatement(Definition::ModuleConstant(constant)) => {
                     Some(hover_for_module_constant(constant, lines, module))
                 }
+                Located::Constant(constant) => Some(hover_for_constant(constant, lines, module)),
                 Located::ModuleStatement(Definition::Import(import)) => {
                     let Some(module) = this.compiler.get_module_interface(&import.module) else {
                         return Ok(None);
@@ -910,7 +1000,7 @@ Unused labelled fields:
                         range,
                     })
                 }
-                Located::Expression(expression) => Some(hover_for_expression(
+                Located::Expression { expression, .. } => Some(hover_for_expression(
                     expression,
                     lines,
                     module,
@@ -950,8 +1040,8 @@ Unused labelled fields:
     ) -> Response<Option<SignatureHelp>> {
         self.respond(
             |this| match this.node_at_position(&params.text_document_position_params) {
-                Some((_lines, Located::Expression(expr))) => {
-                    Ok(signature_help::for_expression(expr))
+                Some((_lines, Located::Expression { expression, .. })) => {
+                    Ok(signature_help::for_expression(expression))
                 }
                 Some((_lines, _located)) => Ok(None),
                 None => Ok(None),
@@ -965,7 +1055,7 @@ Unused labelled fields:
         module: &'a Module,
     ) -> Option<(LineNumbers, Located<'a>)> {
         let line_numbers = LineNumbers::new(&module.code);
-        let byte_index = line_numbers.byte_index(params.position.line, params.position.character);
+        let byte_index = line_numbers.byte_index(params.position);
         let node = module.find_node(byte_index);
         let node = node?;
         Some((line_numbers, node))
@@ -1138,7 +1228,11 @@ fn hover_for_pattern(pattern: &TypedPattern, line_numbers: LineNumbers, module: 
 
 fn get_function_type(fun: &TypedFunction) -> Type {
     Type::Fn {
-        args: fun.arguments.iter().map(|arg| arg.type_.clone()).collect(),
+        arguments: fun
+            .arguments
+            .iter()
+            .map(|argument| argument.type_.clone())
+            .collect(),
         return_: fun.return_type.clone(),
     }
 }
@@ -1239,6 +1333,19 @@ fn hover_for_module_constant(
     Hover {
         contents: HoverContents::Scalar(MarkedString::String(contents)),
         range: Some(src_span_to_lsp_range(constant.location, &line_numbers)),
+    }
+}
+
+fn hover_for_constant(
+    constant: &TypedConstant,
+    line_numbers: LineNumbers,
+    module: &Module,
+) -> Hover {
+    let type_ = Printer::new(&module.ast.names).print_type(&constant.type_());
+    let contents = format!("```gleam\n{type_}\n```");
+    Hover {
+        contents: HoverContents::Scalar(MarkedString::String(contents)),
+        range: Some(src_span_to_lsp_range(constant.location(), &line_numbers)),
     }
 }
 
@@ -1405,68 +1512,6 @@ fn code_action_unused_values(
     }
 }
 
-/// Code action to remove unused imports.
-///
-fn code_action_unused_imports(
-    module: &Module,
-    line_numbers: &LineNumbers,
-    params: &lsp::CodeActionParams,
-    actions: &mut Vec<CodeAction>,
-) {
-    let uri = &params.text_document.uri;
-    let unused: Vec<&SrcSpan> = module
-        .ast
-        .type_info
-        .warnings
-        .iter()
-        .filter_map(|warning| match warning {
-            type_::Warning::UnusedImportedModuleAlias { location, .. }
-            | type_::Warning::UnusedImportedModule { location, .. } => Some(location),
-            _ => None,
-        })
-        .collect();
-
-    if unused.is_empty() {
-        return;
-    }
-
-    let mut hovered = false;
-    let mut edits = Vec::with_capacity(unused.len());
-
-    for unused in unused {
-        let SrcSpan { start, end } = *unused;
-
-        // If removing an unused alias or at the beginning of the file, don't backspace
-        // Otherwise, adjust the end position by 1 to ensure the entire line is deleted with the import.
-        let adjusted_end = if delete_line(unused, line_numbers) {
-            end + 1
-        } else {
-            end
-        };
-
-        let range = src_span_to_lsp_range(SrcSpan::new(start, adjusted_end), line_numbers);
-        // Keep track of whether any unused import has is where the cursor is
-        hovered = hovered || overlaps(params.range, range);
-
-        edits.push(TextEdit {
-            range,
-            new_text: "".into(),
-        });
-    }
-
-    // If none of the imports are where the cursor is we do nothing
-    if !hovered {
-        return;
-    }
-    edits.sort_by_key(|edit| edit.range.start);
-
-    CodeActionBuilder::new("Remove unused imports")
-        .kind(lsp_types::CodeActionKind::QUICKFIX)
-        .changes(uri.clone(), edits)
-        .preferred(true)
-        .push_to(actions);
-}
-
 struct NameCorrection {
     pub location: SrcSpan,
     pub correction: EcoString,
@@ -1524,13 +1569,6 @@ fn code_action_fix_names(
     }
 }
 
-// Check if the edit empties a whole line; if so, delete the line.
-fn delete_line(span: &SrcSpan, line_numbers: &LineNumbers) -> bool {
-    line_numbers.line_starts.iter().any(|&line_start| {
-        line_start == span.start && line_numbers.line_starts.contains(&(span.end + 1))
-    })
-}
-
 fn get_expr_qualified_name(expression: &TypedExpr) -> Option<(&EcoString, &EcoString)> {
     match expression {
         TypedExpr::Var {
@@ -1575,12 +1613,17 @@ fn get_hexdocs_link_section(
     ast: &TypedModule,
     hex_deps: &HashSet<EcoString>,
 ) -> Option<String> {
-    let package_name = ast.definitions.iter().find_map(|def| match def {
-        Definition::Import(p) if p.module == module_name && hex_deps.contains(&p.package) => {
-            Some(&p.package)
-        }
-        _ => None,
-    })?;
+    let package_name = ast
+        .definitions
+        .iter()
+        .find_map(|definition| match definition {
+            Definition::Import(import)
+                if import.module == module_name && hex_deps.contains(&import.package) =>
+            {
+                Some(&import.package)
+            }
+            _ => None,
+        })?;
 
     Some(format_hexdocs_link_section(
         package_name,

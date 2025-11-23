@@ -22,7 +22,9 @@ use crate::{
     dep_tree,
     error::{FileIoAction, FileKind, ImportCycleLocationDetails},
     io::{self, CommandExecutor, FileSystemReader, FileSystemWriter, files_with_extension},
-    metadata, type_,
+    metadata,
+    paths::ProjectPaths,
+    type_,
     uid::UniqueIdGenerator,
     warning::WarningEmitter,
 };
@@ -56,7 +58,7 @@ pub struct PackageLoader<'a, IO> {
     io: IO,
     ids: UniqueIdGenerator,
     mode: Mode,
-    root: &'a Utf8Path,
+    paths: ProjectPaths,
     warnings: &'a WarningEmitter,
     codegen: CodegenRequired,
     artefact_directory: &'a Utf8Path,
@@ -91,7 +93,7 @@ where
             io,
             ids,
             mode,
-            root,
+            paths: ProjectPaths::new(root.into()),
             warnings,
             codegen,
             target,
@@ -184,6 +186,16 @@ where
         let bytes = self.io.read_bytes(&cache_files.cache_path)?;
         let mut module = metadata::ModuleDecoder::new(self.ids.clone()).read(bytes.as_slice())?;
 
+        if self.io.exists(&cache_files.inline_path) {
+            let bytes = self.io.read_bytes(&cache_files.inline_path)?;
+            module.inline_functions = bincode::deserialize(&bytes).map_err(|e| Error::FileIo {
+                kind: FileKind::File,
+                action: FileIoAction::Parse,
+                path: cache_files.inline_path,
+                err: Some(e.to_string()),
+            })?;
+        }
+
         // Load warnings
         if self.cached_warnings.should_use() {
             let path = cache_files.warnings_path;
@@ -207,7 +219,7 @@ where
 
         let mut inputs = Inputs::new(self.already_defined_modules);
 
-        let src = self.root.join("src");
+        let src = self.paths.src_directory();
         let mut loader = ModuleLoader {
             io: self.io.clone(),
             warnings: self.warnings,
@@ -231,12 +243,25 @@ where
             }
         }
 
-        // Test
-        if self.mode.includes_tests() {
-            let test = self.root.join("test");
+        // Test and dev
+        if self.mode.includes_dev_code() {
+            let test = self.paths.test_directory();
             loader.origin = Origin::Test;
 
             for file in GleamFile::iterate_files_in_directory(&self.io, &test) {
+                match file {
+                    Ok(file) => {
+                        let input = loader.load(file)?;
+                        inputs.insert(input)?;
+                    }
+                    Err(warning) => self.warnings.emit(warning),
+                }
+            }
+
+            let dev = self.paths.dev_directory();
+            loader.origin = Origin::Dev;
+
+            for file in GleamFile::iterate_files_in_directory(&self.io, &dev) {
                 match file {
                     Ok(file) => {
                         let input = loader.load(file)?;
@@ -1770,6 +1795,7 @@ pub struct CacheFiles {
     pub cache_path: Utf8PathBuf,
     pub meta_path: Utf8PathBuf,
     pub warnings_path: Utf8PathBuf,
+    pub inline_path: Utf8PathBuf,
 }
 
 impl CacheFiles {
@@ -1784,18 +1810,23 @@ impl CacheFiles {
         let warnings_path = artefact_directory
             .join(file_name.as_str())
             .with_extension("cache_warnings");
+        let inline_path = artefact_directory
+            .join(file_name.as_str())
+            .with_extension("cache_inline");
 
         Self {
             cache_path,
             meta_path,
             warnings_path,
+            inline_path,
         }
     }
 
     pub fn delete(&self, io: &dyn io::FileSystemWriter) -> Result<()> {
         io.delete_file(&self.cache_path)?;
         io.delete_file(&self.meta_path)?;
-        io.delete_file(&self.warnings_path)
+        io.delete_file(&self.warnings_path)?;
+        io.delete_file(&self.inline_path)
     }
 
     /// Iterates over `.cache_meta` files in the given directory,

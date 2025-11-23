@@ -1,5 +1,7 @@
 use vec1::Vec1;
 
+use crate::parse::LiteralFloatValue;
+
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +15,7 @@ pub enum UntypedExpr {
     Float {
         location: SrcSpan,
         value: EcoString,
+        float_value: LiteralFloatValue,
     },
 
     String {
@@ -111,7 +114,14 @@ pub enum UntypedExpr {
 
     Echo {
         location: SrcSpan,
+        /// This is the position where the echo keyword ends:
+        /// ```gleam
+        /// echo wibble
+        /// // ^ ends here!
+        /// ```
+        keyword_end: u32,
         expression: Option<Box<Self>>,
+        message: Option<Box<Self>>,
     },
 
     BitArray {
@@ -134,16 +144,6 @@ pub enum UntypedExpr {
     NegateInt {
         location: SrcSpan,
         value: Box<Self>,
-    },
-
-    /// A placeholder used when parsing is incomplete or when a function body is
-    /// missing due to an external implementation being given for the function
-    /// instead.
-    /// TODO: This variant should be removed in future, but it requires some
-    /// rework of the type inference code to be able to handle functions that do
-    /// not have a body.
-    Placeholder {
-        location: SrcSpan,
     },
 }
 
@@ -173,7 +173,6 @@ impl UntypedExpr {
             | Self::NegateInt { location, .. }
             | Self::NegateBool { location, .. }
             | Self::TupleIndex { location, .. }
-            | Self::Placeholder { location, .. }
             | Self::FieldAccess { location, .. }
             | Self::RecordUpdate { location, .. } => *location,
         }
@@ -202,11 +201,34 @@ impl UntypedExpr {
         }
     }
 
-    pub fn is_simple_constant(&self) -> bool {
-        matches!(
-            self,
-            Self::String { .. } | Self::Int { .. } | Self::Float { .. }
-        )
+    pub fn can_have_multiple_per_line(&self) -> bool {
+        match self {
+            UntypedExpr::Int { .. }
+            | UntypedExpr::Float { .. }
+            | UntypedExpr::String { .. }
+            | UntypedExpr::Var { .. } => true,
+
+            UntypedExpr::NegateBool { value, .. }
+            | UntypedExpr::NegateInt { value, .. }
+            | UntypedExpr::FieldAccess {
+                container: value, ..
+            } => value.can_have_multiple_per_line(),
+
+            UntypedExpr::Block { .. }
+            | UntypedExpr::Fn { .. }
+            | UntypedExpr::List { .. }
+            | UntypedExpr::Call { .. }
+            | UntypedExpr::BinOp { .. }
+            | UntypedExpr::PipeLine { .. }
+            | UntypedExpr::Case { .. }
+            | UntypedExpr::Tuple { .. }
+            | UntypedExpr::TupleIndex { .. }
+            | UntypedExpr::Todo { .. }
+            | UntypedExpr::Panic { .. }
+            | UntypedExpr::Echo { .. }
+            | UntypedExpr::BitArray { .. }
+            | UntypedExpr::RecordUpdate { .. } => false,
+        }
     }
 
     pub fn is_tuple(&self) -> bool {
@@ -222,14 +244,6 @@ impl UntypedExpr {
     #[must_use]
     pub fn is_call(&self) -> bool {
         matches!(self, Self::Call { .. })
-    }
-
-    /// Returns `true` if the untyped expr is [`Placeholder`].
-    ///
-    /// [`Placeholder`]: UntypedExpr::Placeholder
-    #[must_use]
-    pub fn is_placeholder(&self) -> bool {
-        matches!(self, Self::Placeholder { .. })
     }
 
     #[must_use]

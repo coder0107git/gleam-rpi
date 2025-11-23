@@ -9,7 +9,6 @@
     clippy::needless_continue,
     clippy::needless_borrow,
     clippy::match_wildcard_for_single_variants,
-    clippy::match_on_vec_items,
     clippy::imprecise_flops,
     clippy::suboptimal_flops,
     clippy::lossy_float_literal,
@@ -93,8 +92,10 @@ pub mod warning;
 pub(crate) mod ast_folder;
 mod call_graph;
 mod dep_tree;
+pub(crate) mod derivation_tree;
 mod exhaustiveness;
 pub(crate) mod graph;
+pub(crate) mod inline;
 mod reference;
 
 pub use error::{Error, Result};

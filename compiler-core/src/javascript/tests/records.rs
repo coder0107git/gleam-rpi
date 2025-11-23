@@ -68,3 +68,48 @@ pub fn get_name(person: Person) { person.name }
 pub fn get_age(person: Person) { person.age }"
     );
 }
+
+// https://github.com/gleam-lang/gleam/issues/4603
+#[test]
+fn field_named_x0() {
+    assert_js!(
+        "
+pub type Wibble {
+  Wibble(Int, x0: String)
+}
+"
+    );
+}
+
+#[test]
+fn field_named_then_is_escaped() {
+    assert_js!(
+        "
+pub type Wibble {
+  Wibble(then: fn() -> Int)
+}
+"
+    );
+}
+
+#[test]
+fn field_named_constructor_is_escaped() {
+    assert_js!(
+        "
+pub type Wibble {
+  Wibble(constructor: fn() -> Wibble)
+}
+"
+    );
+}
+
+#[test]
+fn field_named_prototype_is_escaped() {
+    assert_js!(
+        "
+pub type Wibble {
+  Wibble(prototype: String)
+}
+"
+    );
+}

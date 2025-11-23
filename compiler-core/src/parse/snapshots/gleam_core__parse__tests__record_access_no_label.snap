@@ -57,6 +57,7 @@ Parsed {
                                                 module: None,
                                                 name: "String",
                                                 arguments: [],
+                                                start_parentheses: None,
                                             },
                                         ),
                                         location: SrcSpan {
@@ -76,6 +77,8 @@ Parsed {
                         opaque: false,
                         parameters: [],
                         typed_parameters: [],
+                        external_erlang: None,
+                        external_javascript: None,
                     },
                 ),
                 target: None,
@@ -87,6 +90,9 @@ Parsed {
                             start: 45,
                             end: 56,
                         },
+                        body_start: Some(
+                            57,
+                        ),
                         end_position: 75,
                         name: Some(
                             (
@@ -157,6 +163,7 @@ Parsed {
                             uses_erlang_externals: false,
                             uses_javascript_externals: false,
                         },
+                        purity: Pure,
                     },
                 ),
                 target: None,
@@ -167,7 +174,9 @@ Parsed {
             imported_modules: {},
             type_variables: {},
             local_value_constructors: {},
+            reexport_aliases: {},
         },
+        unused_definition_positions: {},
     },
     extra: ModuleExtra {
         module_comments: [],
@@ -186,5 +195,6 @@ Parsed {
             73,
             75,
         ],
+        trailing_commas: [],
     },
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 use lsp_types::Location;
@@ -6,7 +6,7 @@ use lsp_types::Location;
 use crate::{
     analyse,
     ast::{
-        self, ArgNames, CustomType, Definition, Function, ModuleConstant, Pattern,
+        self, ArgNames, BitArraySize, CustomType, Definition, Function, ModuleConstant, Pattern,
         RecordConstructor, SrcSpan, TypedExpr, TypedModule, visit::Visit,
     },
     build::Located,
@@ -25,6 +25,7 @@ pub enum Referenced {
         definition_location: SrcSpan,
         location: SrcSpan,
         origin: Option<VariableOrigin>,
+        name: EcoString,
     },
     ModuleValue {
         module: EcoString,
@@ -46,35 +47,45 @@ pub fn reference_for_ast_node(
     current_module: &EcoString,
 ) -> Option<Referenced> {
     match found {
-        Located::Expression(TypedExpr::Var {
-            constructor:
-                ValueConstructor {
-                    variant:
-                        ValueConstructorVariant::LocalVariable {
-                            location: definition_location,
-                            origin,
+        Located::Expression {
+            expression:
+                TypedExpr::Var {
+                    constructor:
+                        ValueConstructor {
+                            variant:
+                                ValueConstructorVariant::LocalVariable {
+                                    location: definition_location,
+                                    origin,
+                                },
+                            ..
                         },
-                    ..
+                    location,
+                    name,
                 },
-            location,
             ..
-        }) => Some(Referenced::LocalVariable {
+        } => Some(Referenced::LocalVariable {
             definition_location: *definition_location,
             location: *location,
             origin: Some(origin.clone()),
+            name: name.clone(),
         }),
         Located::Pattern(Pattern::Variable {
-            location, origin, ..
+            location,
+            origin,
+            name,
+            ..
         }) => Some(Referenced::LocalVariable {
             definition_location: *location,
             location: *location,
             origin: Some(origin.clone()),
+            name: name.clone(),
         }),
-        Located::Pattern(Pattern::VarUsage {
+        Located::Pattern(Pattern::BitArraySize(BitArraySize::Variable {
             constructor,
             location,
+            name,
             ..
-        }) => constructor
+        })) => constructor
             .as_ref()
             .and_then(|constructor| match &constructor.variant {
                 ValueConstructorVariant::LocalVariable {
@@ -84,38 +95,48 @@ pub fn reference_for_ast_node(
                     definition_location: *definition_location,
                     location: *location,
                     origin: Some(origin.clone()),
+                    name: name.clone(),
                 }),
                 _ => None,
             }),
-        Located::Pattern(Pattern::Assign { location, .. }) => Some(Referenced::LocalVariable {
-            definition_location: *location,
-            location: *location,
-            origin: None,
-        }),
+        Located::Pattern(Pattern::Assign { location, name, .. }) => {
+            Some(Referenced::LocalVariable {
+                definition_location: *location,
+                location: *location,
+                origin: None,
+                name: name.clone(),
+            })
+        }
         Located::Arg(arg) => match &arg.names {
-            ArgNames::Named { location, .. }
+            ArgNames::Named { location, name }
             | ArgNames::NamedLabelled {
                 name_location: location,
+                name,
                 ..
             } => Some(Referenced::LocalVariable {
                 definition_location: *location,
                 location: *location,
                 origin: None,
+                name: name.clone(),
             }),
             ArgNames::Discard { .. } | ArgNames::LabelledDiscard { .. } => None,
         },
-        Located::Expression(TypedExpr::Var {
-            constructor:
-                ValueConstructor {
-                    variant:
-                        ValueConstructorVariant::ModuleConstant { module, .. }
-                        | ValueConstructorVariant::ModuleFn { module, .. },
+        Located::Expression {
+            expression:
+                TypedExpr::Var {
+                    constructor:
+                        ValueConstructor {
+                            variant:
+                                ValueConstructorVariant::ModuleConstant { module, .. }
+                                | ValueConstructorVariant::ModuleFn { module, .. },
+                            ..
+                        },
+                    name,
+                    location,
                     ..
                 },
-            name,
-            location,
             ..
-        }) => Some(Referenced::ModuleValue {
+        } => Some(Referenced::ModuleValue {
             module: module.clone(),
             name: name.clone(),
             location: *location,
@@ -123,14 +144,19 @@ pub fn reference_for_ast_node(
             target_kind: RenameTarget::Unqualified,
         }),
 
-        Located::Expression(TypedExpr::ModuleSelect {
-            module_name,
-            label,
-            constructor: ModuleValueConstructor::Fn { .. } | ModuleValueConstructor::Constant { .. },
-            location,
-            field_start,
+        Located::Expression {
+            expression:
+                TypedExpr::ModuleSelect {
+                    module_name,
+                    label,
+                    constructor:
+                        ModuleValueConstructor::Fn { .. } | ModuleValueConstructor::Constant { .. },
+                    location,
+                    field_start,
+                    ..
+                },
             ..
-        }) => Some(Referenced::ModuleValue {
+        } => Some(Referenced::ModuleValue {
             module: module_name.clone(),
             name: label.clone(),
 
@@ -155,29 +181,37 @@ pub fn reference_for_ast_node(
             name_kind: Named::Function,
             target_kind: RenameTarget::Definition,
         }),
-        Located::Expression(TypedExpr::Var {
-            constructor:
-                ValueConstructor {
-                    variant: ValueConstructorVariant::Record { module, name, .. },
+        Located::Expression {
+            expression:
+                TypedExpr::Var {
+                    constructor:
+                        ValueConstructor {
+                            variant: ValueConstructorVariant::Record { module, name, .. },
+                            ..
+                        },
+                    location,
                     ..
                 },
-            location,
             ..
-        }) => Some(Referenced::ModuleValue {
+        } => Some(Referenced::ModuleValue {
             module: module.clone(),
             name: name.clone(),
             location: *location,
             name_kind: Named::CustomTypeVariant,
             target_kind: RenameTarget::Unqualified,
         }),
-        Located::Expression(TypedExpr::ModuleSelect {
-            module_name,
-            label,
-            constructor: ModuleValueConstructor::Record { .. },
-            location,
-            field_start,
+        Located::Expression {
+            expression:
+                TypedExpr::ModuleSelect {
+                    module_name,
+                    label,
+                    constructor: ModuleValueConstructor::Record { .. },
+                    location,
+                    field_start,
+                    ..
+                },
             ..
-        }) => Some(Referenced::ModuleValue {
+        } => Some(Referenced::ModuleValue {
             module: module_name.clone(),
             name: label.clone(),
             location: SrcSpan::new(*field_start, location.end),
@@ -308,26 +342,169 @@ fn find_references_in_module(
     }
 }
 
-pub fn find_variable_references(
-    module: &TypedModule,
-    definition_location: SrcSpan,
-) -> Vec<SrcSpan> {
-    let mut finder = FindVariableReferences {
-        references: Vec::new(),
-        definition_location,
-    };
-    finder.visit_typed_module(module);
-    finder.references
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VariableReference {
+    pub location: SrcSpan,
+    pub kind: VariableReferenceKind,
 }
 
-struct FindVariableReferences {
-    references: Vec<SrcSpan>,
-    definition_location: SrcSpan,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VariableReferenceKind {
+    Variable,
+    LabelShorthand,
+}
+
+/// How to treat variables defined in alternative patterns
+enum AlternativeVariable {
+    Track,
+    Ignore,
+}
+
+pub struct FindVariableReferences {
+    // Due to the structure of some AST nodes (for example, record updates),
+    // when we traverse the AST it is possible to accidentally duplicate references.
+    // To avoid this, we use a `HashSet` instead of a `Vec` here.
+    // See: https://github.com/gleam-lang/gleam/issues/4859 and the linked PR.
+    references: HashSet<VariableReference>,
+    definition_location: DefinitionLocation,
+    alternative_variable: AlternativeVariable,
+    name: EcoString,
+}
+
+/// Where the variable we're finding references for is defined.
+///
+enum DefinitionLocation {
+    /// This is the location where the variable is defined, nothing special is
+    /// going on here. For example:
+    ///
+    /// ```gleam
+    ///    let wibble = 1
+    /// //   ^^^^^^ Definition location for `wibble`
+    ///    wibble + 1
+    ///    ^^^^^^
+    /// // `wibble` used here, defined earlier
+    /// ```
+    ///
+    Regular { location: SrcSpan },
+
+    /// When dealing with alternative patterns and aliases we need special care:
+    /// each usage wil always reference the first alternative where a variable
+    /// is defined and not the following ones. For example:
+    ///
+    /// ```gleam
+    /// case wibble {
+    ///   [] as var | [_] as var -> var
+    ///   //    ^^^                 ^^^ If we look where `var` thinks it's defined
+    ///   //    It will say it's defined here!
+    /// }
+    /// ```
+    ///
+    /// This poses a problem if we start the renaming from the second
+    /// alternative pattern:
+    ///
+    /// ```gleam
+    /// case wibble {
+    ///   [] as var | [_] as var -> var
+    ///   //                 ^^^ Since `var` uses the first alternative as its
+    ///   //                     definition location, this would not be considered
+    ///   //                     a reference to that same var.
+    /// }
+    /// ```
+    ///
+    /// So we keep track of the location of this definition, but we also need
+    /// to store the location of the first definition in the alternative case
+    /// (that's `first_alternative_location`), so that when we look for
+    /// references we can check against this one that is canonically used by
+    /// expressions in the AST
+    ///
+    Alternative {
+        location: SrcSpan,
+        first_alternative_location: SrcSpan,
+    },
+}
+
+impl FindVariableReferences {
+    pub fn new(variable_definition_location: SrcSpan, variable_name: EcoString) -> Self {
+        Self {
+            references: HashSet::new(),
+            definition_location: DefinitionLocation::Regular {
+                location: variable_definition_location,
+            },
+            alternative_variable: AlternativeVariable::Ignore,
+            name: variable_name,
+        }
+    }
+
+    /// Where the definition for which we're accumulating references is
+    /// originally defined. In case of alternative patterns this will point to
+    /// the first occurrence of that name! Look at the docs for
+    /// `DefinitionLocation` to learn more on why this is needed.
+    ///
+    fn definition_origin_location(&self) -> SrcSpan {
+        match self.definition_location {
+            DefinitionLocation::Regular { location }
+            | DefinitionLocation::Alternative {
+                first_alternative_location: location,
+                ..
+            } => location,
+        }
+    }
+
+    /// This is the location of the definition for which we're accumulating
+    /// references. In most cases you'll want to use `definition_origin_location`.
+    /// The difference between the two is explained in greater detail in the docs
+    /// for `DefinitionLocation`.
+    ///
+    fn definition_location(&self) -> SrcSpan {
+        match self.definition_location {
+            DefinitionLocation::Regular { location }
+            | DefinitionLocation::Alternative { location, .. } => location,
+        }
+    }
+
+    fn update_alternative_origin(&mut self, alternative_location: SrcSpan) {
+        match self.definition_location {
+            // We've found the location of the origin of an alternative pattern.
+            DefinitionLocation::Regular { location } if alternative_location < location => {
+                self.definition_location = DefinitionLocation::Alternative {
+                    location,
+                    first_alternative_location: alternative_location,
+                };
+            }
+
+            // Since the new alternative location we've found is smaller, that
+            // is the actual first one for the alternative pattern!
+            DefinitionLocation::Alternative {
+                location,
+                first_alternative_location,
+            } if alternative_location < first_alternative_location => {
+                self.definition_location = DefinitionLocation::Alternative {
+                    location,
+                    first_alternative_location: alternative_location,
+                };
+            }
+
+            _ => (),
+        };
+    }
+
+    pub fn find_in_module(mut self, module: &TypedModule) -> HashSet<VariableReference> {
+        self.visit_typed_module(module);
+        self.references
+    }
+
+    pub fn find(mut self, expression: &TypedExpr) -> HashSet<VariableReference> {
+        self.visit_typed_expr(expression);
+        self.references
+    }
 }
 
 impl<'ast> Visit<'ast> for FindVariableReferences {
     fn visit_typed_function(&mut self, fun: &'ast ast::TypedFunction) {
-        if fun.full_location().contains(self.definition_location.start) {
+        if fun
+            .full_location()
+            .contains(self.definition_origin_location().start)
+        {
             ast::visit::visit_typed_function(self, fun);
         }
     }
@@ -342,7 +519,12 @@ impl<'ast> Visit<'ast> for FindVariableReferences {
             ValueConstructorVariant::LocalVariable {
                 location: definition_location,
                 ..
-            } if definition_location == self.definition_location => self.references.push(*location),
+            } if definition_location == self.definition_origin_location() => {
+                _ = self.references.insert(VariableReference {
+                    location: *location,
+                    kind: VariableReferenceKind::Variable,
+                });
+            }
             _ => {}
         }
     }
@@ -354,16 +536,102 @@ impl<'ast> Visit<'ast> for FindVariableReferences {
         _type_: &'ast std::sync::Arc<Type>,
         definition_location: &'ast SrcSpan,
     ) {
-        if *definition_location == self.definition_location {
-            self.references.push(*location)
+        if *definition_location == self.definition_origin_location() {
+            _ = self.references.insert(VariableReference {
+                location: *location,
+                kind: VariableReferenceKind::Variable,
+            });
         }
     }
 
-    fn visit_typed_pattern_var_usage(
+    fn visit_typed_clause(&mut self, clause: &'ast ast::TypedClause) {
+        // If this alternative pattern contains the variable we are finding
+        // references for, we track that so we can find alternative definitions
+        // of the target variable.
+        if clause
+            .pattern_location()
+            .contains(self.definition_origin_location().start)
+        {
+            self.alternative_variable = AlternativeVariable::Track;
+        }
+
+        for pattern in clause.pattern.iter() {
+            self.visit_typed_pattern(pattern);
+        }
+        for patterns in clause.alternative_patterns.iter() {
+            for pattern in patterns {
+                self.visit_typed_pattern(pattern);
+            }
+        }
+
+        self.alternative_variable = AlternativeVariable::Ignore;
+
+        if let Some(guard) = &clause.guard {
+            self.visit_typed_clause_guard(guard);
+        }
+        self.visit_typed_expr(&clause.then);
+    }
+
+    fn visit_typed_pattern_variable(
+        &mut self,
+        location: &'ast SrcSpan,
+        name: &'ast EcoString,
+        _type_: &'ast std::sync::Arc<Type>,
+        _origin: &'ast VariableOrigin,
+    ) {
+        match self.alternative_variable {
+            // If we are inside the same alternative pattern as the target
+            // variable and the name is the same, this is an alternative definition
+            // of the same variable. We don't register the reference if this is
+            // the exact variable though, as that would result in a duplicated
+            // reference.
+            AlternativeVariable::Track
+                if *name == self.name && *location != self.definition_location() =>
+            {
+                self.update_alternative_origin(*location);
+
+                _ = self.references.insert(VariableReference {
+                    location: *location,
+                    kind: VariableReferenceKind::Variable,
+                });
+            }
+            AlternativeVariable::Track | AlternativeVariable::Ignore => {}
+        }
+    }
+
+    fn visit_typed_pattern_assign(
+        &mut self,
+        location: &'ast SrcSpan,
+        name: &'ast EcoString,
+        pattern: &'ast ast::TypedPattern,
+    ) {
+        match self.alternative_variable {
+            // If we are inside the same alternative pattern as the target
+            // variable and the name is the same, this is an alternative definition
+            // of the same variable. We don't register the reference if this is
+            // the exact variable though, as that would result in a duplicated
+            // reference.
+            AlternativeVariable::Track
+                if *name == self.name && *location != self.definition_location() =>
+            {
+                self.update_alternative_origin(*location);
+
+                _ = self.references.insert(VariableReference {
+                    location: *location,
+                    kind: VariableReferenceKind::Variable,
+                });
+            }
+            AlternativeVariable::Track | AlternativeVariable::Ignore => {}
+        }
+
+        ast::visit::visit_typed_pattern_assign(self, location, name, pattern);
+    }
+
+    fn visit_typed_bit_array_size_variable(
         &mut self,
         location: &'ast SrcSpan,
         _name: &'ast EcoString,
-        constructor: &'ast Option<ValueConstructor>,
+        constructor: &'ast Option<Box<ValueConstructor>>,
         _type_: &'ast std::sync::Arc<Type>,
     ) {
         let variant = match constructor {
@@ -374,10 +642,40 @@ impl<'ast> Visit<'ast> for FindVariableReferences {
             ValueConstructorVariant::LocalVariable {
                 location: definition_location,
                 ..
-            } if *definition_location == self.definition_location => {
-                self.references.push(*location)
+            } if *definition_location == self.definition_origin_location() => {
+                _ = self.references.insert(VariableReference {
+                    location: *location,
+                    kind: VariableReferenceKind::Variable,
+                });
             }
             _ => {}
         }
+    }
+
+    fn visit_typed_call_arg(&mut self, arg: &'ast crate::type_::TypedCallArg) {
+        if let TypedExpr::Var {
+            location,
+            constructor,
+            ..
+        } = &arg.value
+        {
+            match &constructor.variant {
+                ValueConstructorVariant::LocalVariable {
+                    location: definition_location,
+                    ..
+                } if arg.uses_label_shorthand()
+                    && *definition_location == self.definition_origin_location() =>
+                {
+                    _ = self.references.insert(VariableReference {
+                        location: *location,
+                        kind: VariableReferenceKind::LabelShorthand,
+                    });
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        ast::visit::visit_typed_call_arg(self, arg);
     }
 }

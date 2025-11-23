@@ -11,14 +11,16 @@ use crate::{
         TypedConstantBitArraySegment, TypedConstantBitArraySegmentOption,
     },
     build::Origin,
-    line_numbers::LineNumbers,
+    line_numbers::{Character, LineNumbers},
+    parse::LiteralFloatValue,
     reference::{Reference, ReferenceKind, ReferenceMap},
     schema_capnp::{self as schema, *},
     type_::{
         self, AccessorsMap, Deprecation, FieldMap, ModuleInterface, Opaque, RecordAccessor,
         References, Type, TypeAliasConstructor, TypeConstructor, TypeValueConstructor,
         TypeValueConstructorField, TypeVariantConstructors, ValueConstructor,
-        ValueConstructorVariant, expression::Implementations,
+        ValueConstructorVariant,
+        expression::{Implementations, Purity},
     },
     uid::UniqueIdGenerator,
 };
@@ -89,6 +91,7 @@ impl ModuleDecoder {
             documentation: self.string_list(reader.get_documentation()?)?,
             contains_echo: reader.get_contains_echo(),
             references: self.references(reader.get_references()?)?,
+            inline_functions: HashMap::new(),
         })
     }
 
@@ -195,6 +198,7 @@ impl ModuleDecoder {
                 message: self.string(deprecation)?,
             }
         };
+        let parameters = read_vec!(&reader.get_parameters()?, self, type_);
         Ok(TypeAliasConstructor {
             publicity: self.publicity(reader.get_publicity()?)?,
             origin: self.src_span(&reader.get_origin()?)?,
@@ -203,6 +207,7 @@ impl ModuleDecoder {
             deprecation,
             documentation: self.optional_string(self.str(reader.get_documentation()?)?),
             arity: reader.get_arity() as usize,
+            parameters,
         })
     }
 
@@ -220,23 +225,24 @@ impl ModuleDecoder {
         let package = self.string(reader.get_package()?)?;
         let module = self.string(reader.get_module()?)?;
         let name = self.string(reader.get_name()?)?;
-        let args = read_vec!(&reader.get_parameters()?, self, type_);
+        let arguments = read_vec!(&reader.get_parameters()?, self, type_);
         let inferred_variant = self.inferred_variant(&reader.get_inferred_variant()?)?;
+        let publicity = self.publicity(reader.get_publicity()?)?;
 
         Ok(Arc::new(Type::Named {
-            publicity: Publicity::Public,
+            publicity,
             package,
             module,
             name,
-            args,
+            arguments,
             inferred_variant,
         }))
     }
 
     fn type_fn(&mut self, reader: &schema::type_::fn_::Reader<'_>) -> Result<Arc<Type>> {
         let return_ = self.type_(&reader.get_return()?)?;
-        let args = read_vec!(&reader.get_arguments()?, self, type_);
-        Ok(Arc::new(Type::Fn { args, return_ }))
+        let arguments = read_vec!(&reader.get_arguments()?, self, type_);
+        Ok(Arc::new(Type::Fn { arguments, return_ }))
     }
 
     fn type_tuple(&mut self, reader: &schema::type_::tuple::Reader<'_>) -> Result<Arc<Type>> {
@@ -314,6 +320,7 @@ impl ModuleDecoder {
         Ok(TypeValueConstructorField {
             type_: self.type_(&reader.get_type()?)?,
             label: self.optional_string(self.str(reader.get_label()?)?),
+            documentation: self.optional_string(self.str(reader.get_documentation()?)?),
         })
     }
 
@@ -390,6 +397,8 @@ impl ModuleDecoder {
         Constant::Float {
             location: Default::default(),
             value: value.into(),
+            float_value: LiteralFloatValue::parse(value)
+                .expect("float value to parse as non-NaN f64"),
         }
     }
 
@@ -422,15 +431,16 @@ impl ModuleDecoder {
     fn constant_record(&mut self, reader: &constant::record::Reader<'_>) -> Result<TypedConstant> {
         let type_ = self.type_(&reader.get_type()?)?;
         let tag = self.string(reader.get_tag()?)?;
-        let args = read_vec!(reader.get_args()?, self, constant_call_arg);
+        let arguments = read_vec!(reader.get_args()?, self, constant_call_arg);
         Ok(Constant::Record {
             location: Default::default(),
             module: Default::default(),
             name: Default::default(),
-            args,
+            arguments,
             tag,
             type_,
             field_map: None,
+            record_constructor: None,
         })
     }
 
@@ -601,6 +611,13 @@ impl ModuleDecoder {
         &self,
         reader: &value_constructor_variant::module_fn::Reader<'_>,
     ) -> Result<ValueConstructorVariant> {
+        let purity = match reader.get_purity()?.which()? {
+            purity::Which::Pure(()) => Purity::Pure,
+            purity::Which::TrustedPure(()) => Purity::TrustedPure,
+            purity::Which::Impure(()) => Purity::Impure,
+            purity::Which::Unknown(()) => Purity::Unknown,
+        };
+
         Ok(ValueConstructorVariant::ModuleFn {
             name: self.string(reader.get_name()?)?,
             module: self.string(reader.get_module()?)?,
@@ -611,6 +628,7 @@ impl ModuleDecoder {
             implementations: self.implementations(reader.get_implementations()?),
             external_erlang: self.optional_external(reader.get_external_erlang()?)?,
             external_javascript: self.optional_external(reader.get_external_javascript()?)?,
+            purity,
         })
     }
 
@@ -687,6 +705,7 @@ impl ModuleDecoder {
             index: reader.get_index() as u64,
             label: self.string(reader.get_label()?)?,
             type_: self.type_(&reader.get_type()?)?,
+            documentation: self.optional_string(self.str(reader.get_documentation()?)?),
         })
     }
 
@@ -698,7 +717,28 @@ impl ModuleDecoder {
         Ok(LineNumbers {
             length: reader.get_length(),
             line_starts: read_vec!(reader.get_line_starts()?, self, line_starts),
+            mapping: self.mapping(reader.get_mapping()?),
         })
+    }
+
+    fn mapping(
+        &self,
+        reader: capnp::struct_list::Reader<'_, character::Owned>,
+    ) -> HashMap<usize, Character> {
+        let mut map = HashMap::with_capacity(reader.len() as usize);
+        for character in reader.into_iter() {
+            let byte_index = character.get_byte_index() as usize;
+            let length_utf8 = character.get_length_utf8();
+            let length_utf16 = character.get_length_utf16();
+            _ = map.insert(
+                byte_index,
+                Character {
+                    length_utf16,
+                    length_utf8,
+                },
+            )
+        }
+        map
     }
 
     fn version(&self, reader: &version::Reader<'_>) -> hexpm::version::Version {

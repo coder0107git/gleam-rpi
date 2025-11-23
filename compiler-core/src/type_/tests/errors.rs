@@ -1,5 +1,6 @@
 use crate::{
-    assert_error, assert_internal_module_error, assert_module_error, assert_module_syntax_error,
+    assert_error, assert_internal_module_error, assert_js_module_error, assert_module_error,
+    assert_module_syntax_error,
 };
 
 #[test]
@@ -162,6 +163,16 @@ fn bit_array_segment_type_does_not_allow_size_utf16() {
 #[test]
 fn bit_array_segment_type_does_not_allow_size_utf32() {
     assert_error!("case <<1>> { <<1:utf32-size(5)>> -> 1 }");
+}
+
+#[test]
+fn bit_array_segment_type_does_not_allow_variable_string() {
+    assert_error!("case <<>> { <<a:utf8>> -> 1 _ -> 2 }");
+}
+
+#[test]
+fn bit_array_segment_type_does_not_allow_aliased_variable_string() {
+    assert_error!("case <<>> { <<_ as a:utf8>> -> 1 _ -> 2 }");
 }
 
 #[test]
@@ -372,6 +383,11 @@ fn case_int_tuple_guard() {
 #[test]
 fn wrong_number_of_subjects() {
     assert_error!("case 1 { _, _ -> 1 }");
+}
+
+#[test]
+fn wrong_number_of_subjects_alternative_patterns() {
+    assert_error!("case 1 { _, _ | _ | _, _, _ -> 1 }");
 }
 
 #[test]
@@ -2862,6 +2878,21 @@ fn echo_followed_by_no_expression() {
 }
 
 #[test]
+fn echo_followed_by_no_expression_and_message() {
+    assert_error!("echo as \"wibble\"");
+}
+
+#[test]
+fn echo_followed_by_no_expression_and_invalid_message() {
+    assert_error!("echo as 1");
+}
+
+#[test]
+fn echo_followed_by_invalid_message() {
+    assert_error!("echo 11 as { True || False }");
+}
+
+#[test]
 fn echo_followed_by_no_expression_2() {
     assert_module_error!(
         r#"
@@ -3015,4 +3046,340 @@ fn int_operator_on_floats_2() {
 #[test]
 fn add_on_strings() {
     assert_error!(r#""Hello, " + "Jak""#);
+}
+
+#[test]
+fn fault_tolerant_list() {
+    assert_module_error!(
+        r#"
+pub fn main() {
+  [1, "a", 1.0, "a" + 1]
+}
+"#
+    );
+}
+
+#[test]
+fn fault_tolerant_list_tail() {
+    assert_module_error!(
+        r#"
+pub fn main() {
+  [1, "a", ..["a", "b"]]
+}
+"#
+    );
+}
+
+#[test]
+fn fault_tolerant_negate_bool() {
+    assert_module_error!(
+        r#"
+pub fn main() {
+  !!{ True || a }
+}
+"#
+    );
+}
+
+#[test]
+fn fault_tolerant_negate_int() {
+    assert_module_error!(
+        r#"
+pub fn main() {
+  --{ 1 + a }
+}
+"#
+    );
+}
+
+#[test]
+fn fault_tolerant_tuple() {
+    assert_module_error!(
+        r#"
+pub fn main() {
+  #(1, 1 + "a", not_in_scope)
+}
+"#
+    );
+}
+
+#[test]
+fn error_for_missing_type_parameters() {
+    assert_module_error!(
+        r#"
+type Wibble(a)
+
+type Wobble {
+  Wobble(Wibble)
+}
+"#
+    );
+}
+
+#[test]
+fn double_assignment_in_bit_array() {
+    assert_error!("let assert <<a as b>> = <<>>");
+}
+
+#[test]
+fn negative_size_pattern() {
+    assert_error!("let assert <<1:size(-1)>> = <<>>");
+}
+
+#[test]
+fn zero_size_pattern() {
+    assert_error!("let assert <<1:size(0)>> = <<>>");
+}
+
+// https://github.com/gleam-lang/gleam/issues/3253
+#[test]
+fn bit_array_using_pattern_variables() {
+    assert_error!("let assert #(a, <<b:size(a)>>) = #(2, <<2:2>>)");
+}
+
+#[test]
+fn bit_array_using_pattern_variables_from_other_bit_array() {
+    assert_error!("let assert #(<<a>>, <<b:size(a)>>) = #(<<2>>, <<2:2>>)");
+}
+
+#[test]
+fn non_utf8_string_assignment() {
+    assert_error!(r#"let assert <<"Hello" as message:utf16>> = <<>>"#);
+}
+
+#[test]
+fn shadowed_function_argument() {
+    assert_module_error!(
+        "
+pub fn go(_x) {
+  x + 1
+}
+"
+    );
+}
+
+#[test]
+fn shadowed_fn_argument() {
+    assert_module_error!(
+        "
+pub fn go(x) {
+  fn(_y) {
+    y + x
+  }
+}
+"
+    );
+}
+
+#[test]
+fn shadowed_let_variable() {
+    assert_module_error!(
+        "
+pub fn go() {
+  let _x = 1
+  x + 1
+}
+"
+    );
+}
+
+#[test]
+fn shadowed_pattern_variable() {
+    assert_module_error!(
+        "
+pub type Wibble {
+  Wibble(Int)
+}
+
+pub fn go(x) {
+  case x {
+    Wibble(_y) -> y + 1
+  }
+}
+"
+    );
+}
+
+#[test]
+fn do_not_suggest_ignored_variable_outside_of_current_scope() {
+    assert_module_error!(
+        "
+pub fn go() {
+  let _ = {
+    let _y = 1 // <- this shouldn't be highlighted!
+  }
+  y
+}
+"
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4693
+#[test]
+fn pattern_with_incorrect_arity() {
+    assert_module_error!(
+        "
+pub type Pokemon { Pokemon(name: String, id: Int) }
+
+pub fn main() {
+  case todo {
+    Pokemon(name:) -> todo
+  }
+}
+"
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/3884
+#[test]
+fn show_only_missing_labels() {
+    assert_module_error!(
+        "
+fn wibble(a a: Int, b b: Float, c c: String) {
+    todo
+}
+
+pub fn wobble() {
+    wibble(1, 2.0)
+}
+"
+    );
+}
+#[test]
+fn native_endianness_javascript_target() {
+    assert_js_module_error!(
+        "
+pub fn main() {
+  let assert <<a:native>> = <<10>>
+}
+"
+    );
+}
+
+#[test]
+fn utf8_codepoint_javascript_target() {
+    assert_js_module_error!(
+        "
+pub fn main() {
+  let assert <<a:utf8_codepoint>> = <<10>>
+}
+"
+    );
+}
+
+#[test]
+fn utf16_codepoint_javascript_target() {
+    assert_js_module_error!(
+        "
+pub fn main() {
+  let assert <<a:utf16_codepoint>> = <<10>>
+}
+"
+    );
+}
+
+#[test]
+fn utf32_codepoint_javascript_target() {
+    assert_js_module_error!(
+        "
+pub fn main() {
+  let assert <<a:utf32_codepoint>> = <<10>>
+}
+"
+    );
+}
+
+#[test]
+fn private_opaque_type() {
+    assert_module_error!(
+        "
+opaque type Wibble {
+  Wobble
+}
+"
+    );
+}
+
+#[test]
+fn src_importing_dev_dependency() {
+    assert_module_error!(
+        ("dev_dependency", "some_module", "pub fn main() { Nil }"),
+        "
+import some_module
+
+pub fn main() {
+  some_module.main()
+}
+"
+    );
+}
+
+#[test]
+fn missing_type_constructor_arguments_in_type_annotation_1() {
+    assert_module_error!("pub fn main() -> Result() {}");
+}
+
+#[test]
+fn missing_type_constructor_arguments_in_type_annotation_2() {
+    assert_module_error!(
+        "pub fn main() {
+  let a: Result() = todo
+}"
+    );
+}
+
+#[test]
+fn type_used_as_a_constructor_1() {
+    assert_module_error!("pub fn main() -> Int() {}");
+}
+
+#[test]
+fn type_used_as_a_constructor_2() {
+    assert_module_error!(
+        "pub fn main() {
+  let a: Int() = todo
+}"
+    );
+}
+
+#[test]
+fn type_used_as_a_constructor_with_more_arguments() {
+    assert_module_error!(
+        "pub fn main() {
+  let a: Int(Int, String) = todo
+}"
+    );
+}
+
+#[test]
+fn remembering_record_field_when_type_checking_fails() {
+    assert_module_error!(
+        r#"pub type Wibble {
+  Wibble(x: Int, f: fn(Wobble) -> Int)
+}
+
+pub fn wibble() {
+  Wibble(1, fn(_) { 2 })
+}
+
+pub fn wobble(wibble: Wibble) {
+  wibble.f
+}
+
+pub fn woo(wibble: Wibble) {
+  Wibble(..wibble, x: 1)
+}"#
+    );
+}
+
+#[test]
+fn external_annotation_on_custom_type_with_constructors() {
+    assert_module_error!(
+        r#"
+@external(erlang, "gleam_stdlib", "dict")
+pub type Dict(key, value) {
+  Dict(pairs: List(#(key, value)))
+}
+"#
+    );
 }

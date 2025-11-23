@@ -502,3 +502,97 @@ pub fn main() {
 "
     );
 }
+
+// https://github.com/gleam-lang/gleam/issues/4472
+#[test]
+fn pipe_into_block() {
+    assert_js!(
+        "
+fn side_effects(x) { x }
+
+pub fn main() {
+  1
+  |> side_effects
+  |> {
+    side_effects(2)
+    side_effects
+  }
+}
+"
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4472
+#[test]
+fn pipe_with_block_in_the_middle() {
+    assert_js!(
+        "
+fn side_effects(x) { x }
+
+pub fn main() {
+  1
+  |> side_effects
+  |> {
+    side_effects(2)
+    side_effects
+  }
+  |> side_effects
+}
+"
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4533
+#[test]
+fn immediately_invoked_function_expressions_include_statement_level() {
+    assert_js!(
+        "
+fn identity(x) { x }
+
+pub type Wibble {
+  Wibble(a: Int, b: Int)
+}
+
+pub fn main() {
+  let w = Wibble(1, 2)
+  identity(Wibble(..w |> identity, b: 4)) |> identity
+}
+"
+    );
+}
+
+#[test]
+fn public_function_gets_jsdoc() {
+    assert_js!(
+        "
+/// Hello! This is the documentation of the `main`
+/// function.
+///
+pub fn main() { 1 }
+"
+    );
+}
+
+#[test]
+fn internal_function_gets_ignored_jsdoc() {
+    assert_js!(
+        "
+/// Hello! This is the documentation of the `main`
+/// function, which is internal!
+///
+@internal
+pub fn main() { 1 }
+"
+    );
+}
+
+#[test]
+fn star_slash_in_jsdoc() {
+    assert_js!(
+        "
+/// */
+///
+pub fn main() { 1 }
+"
+    );
+}

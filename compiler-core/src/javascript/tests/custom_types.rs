@@ -5,12 +5,12 @@ use crate::{assert_js, assert_ts_def};
 fn zero_arity_literal() {
     assert_js!(
         r#"
-type Mine {
+pub type Mine {
     This
     ThatOneIsAMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchLongerVariant
 }
 
-fn go() {
+pub fn go() {
     This
     ThatOneIsAMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchLongerVariant
 }
@@ -22,13 +22,13 @@ fn go() {
 fn zero_arity_const() {
     assert_js!(
         r#"
-type Mine {
+pub type Mine {
     This
     ThatOneIsAMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchLongerVariant
 }
 
-const this = This
-const that = ThatOneIsAMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchLongerVariant
+pub const this = This
+pub const that = ThatOneIsAMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchMuchLongerVariant
 "#,
     );
 }
@@ -104,7 +104,7 @@ fn const_zero_arity_imported() {
     assert_js!(
         ("other", r#"pub type One { Two }"#),
         r#"import other
-const x = other.Two
+pub const x = other.Two
 "#,
     );
 }
@@ -114,37 +114,21 @@ fn const_zero_arity_imported_unqualified() {
     assert_js!(
         ("other", r#"pub type One { Two }"#),
         r#"import other.{Two}
-const a = Two
+pub const a = Two
 "#,
     );
 }
-
-// TODO
-// #[test]
-// fn const_zero_arity_imported_unqualified_aliased() {
-//     assert_js!(
-//         ( CURRENT_PACKAGE, "other", r#"pub type One { Two }"#),
-//         r#"import other.{Two as Three}
-// const a = Three
-// "#,
-//         r#"// const a = { type: "Two" };
-
-// import * as Other from "../other.js";
-// const { Two as Three } = other;
-// "#
-//     );
-// }
 
 #[test]
 fn const_with_fields() {
     assert_js!(
         r#"
-type Mine {
+pub type Mine {
   Mine(a: Int, b: Int)
 }
 
-const labels = Mine(b: 2, a: 1)
-const no_labels = Mine(3, 4)
+pub const labels = Mine(b: 2, a: 1)
+pub const no_labels = Mine(3, 4)
 "#,
     );
 }
@@ -167,22 +151,22 @@ pub const no_labels = Mine(3, 4)
 fn unnamed_fields() {
     assert_js!(
         r#"
-type Ip{
+pub type Ip {
     Ip(String)
 }
 
-const local = Ip("0.0.0.0")
+pub const local = Ip("0.0.0.0")
 
-fn build(x) {
+pub fn build(x) {
     x("1.2.3.4")
 }
 
-fn go() {
+pub fn go() {
     build(Ip)
     Ip("5.6.7.8")
 }
 
-fn destructure(x) {
+pub fn destructure(x) {
   let Ip(raw) = x
   raw
 }
@@ -208,12 +192,12 @@ pub const local = Ip("0.0.0.0")
 fn long_name_variant_without_labels() {
     assert_js!(
         r#"
-type TypeWithALongNameAndSeveralArguments{
+pub type TypeWithALongNameAndSeveralArguments{
   TypeWithALongNameAndSeveralArguments(String, String, String, String, String)
 }
 
 
-fn go() {
+pub fn go() {
   TypeWithALongNameAndSeveralArguments
 }
 "#,
@@ -237,24 +221,24 @@ pub const local = TypeWithALongNameAndSeveralArguments("one", "two", "three", "f
 fn custom_type_with_named_fields() {
     assert_js!(
         r#"
-type Cat {
+pub type Cat {
   Cat(name: String, cuteness: Int)
 }
 
-type Box {
+pub type Box {
   Box(occupant: Cat)
 }
 
-const felix = Cat("Felix", 12)
-const tom = Cat(cuteness: 1, name: "Tom")
+pub const felix = Cat("Felix", 12)
+pub const tom = Cat(cuteness: 1, name: "Tom")
 
-fn go() {
+pub fn go() {
   Cat("Nubi", 1)
   Cat(2, name: "Nubi")
   Cat(cuteness: 3, name: "Nubi")
 }
 
-fn update(cat) {
+pub fn update(cat) {
   Cat(..cat, name: "Sid")
   Cat(..cat, name: "Bartholemew Wonder Puss the Fourth !!!!!!!!!!!!!!!!")
   Cat(..new_cat(), name: "Molly")
@@ -262,11 +246,11 @@ fn update(cat) {
   Cat(..box.occupant, cuteness: box.occupant.cuteness + 1)
 }
 
-fn access(cat: Cat) {
+pub fn access(cat: Cat) {
   cat.cuteness
 }
 
-fn new_cat() {
+pub fn new_cat() {
   Cat(name: "Beau", cuteness: 11)
 }
 "#,
@@ -277,11 +261,11 @@ fn new_cat() {
 fn destructure_custom_type_with_named_fields() {
     assert_js!(
         r#"
-type Cat {
+pub type Cat {
   Cat(name: String, cuteness: Int)
 }
 
-fn go(cat) {
+pub fn go(cat) {
   let Cat(x, y) = cat
   let Cat(name: x, ..) = cat
   let assert Cat(cuteness: 4, name: x) = cat
@@ -296,11 +280,11 @@ fn go(cat) {
 fn destructure_custom_type_with_mixed_fields_first_unlabelled() {
     assert_js!(
         r#"
-type Cat {
+pub type Cat {
   Cat(String, cuteness: Int)
 }
 
-fn go(cat) {
+pub fn go(cat) {
   let Cat(x, y) = cat
   let Cat(cuteness: y, ..) = cat
   let Cat(x, cuteness: y) = cat
@@ -315,7 +299,7 @@ fn go(cat) {
 fn nested_pattern_with_labels() {
     assert_js!(
         r#"pub type Box(x) { Box(a: Int, b: x) }
-fn go(x) {
+pub fn go(x) {
   case x {
     Box(a: _, b: Box(a: a, b: b)) -> a + b
     _ -> 1
@@ -685,6 +669,294 @@ pub fn main() {
       _ -> Nil
   }
 }
+"#
+    );
+}
+
+#[test]
+fn constructors_get_their_own_jsdoc() {
+    assert_js!(
+        r#"
+pub type Wibble {
+  /// Wibbling!!
+  Wibble(field: Int)
+
+  /// Wobbling!!
+  Wobble(field: Int)
+}
+"#
+    );
+}
+
+#[test]
+fn singleton_record_equality() {
+    assert_js!(
+        r#"
+pub type Wibble {
+  Wibble
+  Wobble
+}
+
+pub fn is_wibble(w: Wibble) -> Bool {
+  w == Wibble
+}
+"#,
+    );
+}
+
+#[test]
+fn singleton_record_inequality() {
+    assert_js!(
+        r#"
+pub type Wibble {
+  Wibble
+  Wobble
+}
+
+pub fn is_not_wibble(w: Wibble) -> Bool {
+  w != Wibble
+}
+"#,
+    );
+}
+
+#[test]
+fn singleton_record_reverse_order() {
+    assert_js!(
+        r#"
+pub type Wibble {
+  Wibble
+  Wobble
+}
+
+pub fn is_wibble_reverse(w: Wibble) -> Bool {
+  Wibble == w
+}
+"#,
+    );
+}
+
+#[test]
+fn non_singleton_record_equality() {
+    assert_js!(
+        r#"
+pub type Person {
+  Person(name: String, age: Int)
+}
+
+pub fn same_person(p1: Person, p2: Person) -> Bool {
+  p1 == p2
+}
+"#,
+    );
+}
+
+#[test]
+fn multiple_singleton_constructors() {
+    assert_js!(
+        r#"
+pub type Status {
+  Loading
+  Success
+  Error
+}
+
+pub fn is_loading(s: Status) -> Bool {
+  s == Loading
+}
+
+pub fn is_success(s: Status) -> Bool {
+  s == Success
+}
+"#,
+    );
+}
+
+#[test]
+fn mixed_singleton_and_non_singleton() {
+    assert_js!(
+        r#"
+pub type Result {
+  Ok(value: Int)
+  Error
+}
+
+pub fn is_error(r: Result) -> Bool {
+  r == Error
+}
+"#,
+    );
+}
+
+#[test]
+fn singleton_in_case_guard() {
+    assert_js!(
+        r#"
+pub type State {
+  Active
+  Inactive
+}
+
+pub fn process(s: State) -> String {
+  case s {
+    state if state == Active -> "active"
+    _ -> "inactive"
+  }
+}
+"#,
+    );
+}
+
+#[test]
+fn equality_with_non_singleton_variant() {
+    assert_js!(
+        r#"
+pub type Thing {
+  Variant
+  Other(String)
+}
+
+pub fn check_other(x: Thing) -> Bool {
+  x == Other("hello")
+}
+"#,
+    );
+}
+
+#[test]
+fn guard_equality_with_non_singleton_variant() {
+    assert_js!(
+        r#"
+pub type Thing {
+  Variant
+  Other(String)
+}
+
+pub fn process(e: Thing) -> String {
+  case e {
+    value if value == Other("hello") -> "match"
+    _ -> "no match"
+  }
+}
+"#,
+    );
+}
+
+#[test]
+fn variant_defined_in_another_module_qualified_expression() {
+    assert_js!(
+        (
+            "other_module",
+            r#"pub type Thingy { Variant OtherVariant }"#
+        ),
+        r#"
+import other_module
+
+pub fn check(x) -> Bool {
+  x == other_module.Variant
+}
+"#,
+    );
+}
+
+#[test]
+fn variant_defined_in_another_module_unqualified_expression() {
+    assert_js!(
+        ("other_module", r#"pub type Thingy { Variant Other(Int) }"#),
+        r#"
+import other_module.{Variant}
+
+pub fn check(x) -> Bool {
+  x == Variant
+}
+"#,
+    );
+}
+
+#[test]
+fn variant_defined_in_another_module_aliased_expression() {
+    assert_js!(
+        ("other_module", r#"pub type Thingy { Variant Other(Int) }"#),
+        r#"
+import other_module.{Variant as Aliased}
+
+pub fn check(x) -> Bool {
+  x == Aliased
+}
+"#,
+    );
+}
+
+#[test]
+fn variant_defined_in_another_module_qualified_clause_guard() {
+    assert_js!(
+        ("other_module", r#"pub type Thingy { Variant Other(Int) }"#),
+        r#"
+import other_module
+
+pub fn process(e) -> String {
+  case e {
+    value if value == other_module.Variant -> "match"
+    _ -> "no match"
+  }
+}
+"#,
+    );
+}
+
+#[test]
+fn variant_defined_in_another_module_unqualified_clause_guard() {
+    assert_js!(
+        ("other_module", r#"pub type Thingy { Variant Other(Int) }"#),
+        r#"
+import other_module.{Variant}
+
+pub fn process(e) -> String {
+  case e {
+    value if value == Variant -> "match"
+    _ -> "no match"
+  }
+}
+"#,
+    );
+}
+
+#[test]
+fn variant_defined_in_another_module_aliased_clause_guard() {
+    assert_js!(
+        ("other_module", r#"pub type Thingy { Variant Other(Int) }"#),
+        r#"
+import other_module.{Variant as Aliased}
+
+pub fn process(e) -> String {
+  case e {
+    value if value == Aliased -> "match"
+    _ -> "no match"
+  }
+}
+"#,
+    );
+}
+
+#[test]
+fn external_annotation() {
+    assert_ts_def!(
+        r#"
+@external(javascript, "./gleam_stdlib.d.ts", "Dict")
+pub type Dict(key, value)
+"#
+    );
+}
+
+#[test]
+fn external_annotated_type_used_in_function() {
+    assert_ts_def!(
+        r#"
+@external(javascript, "./gleam_stdlib.d.ts", "Dict")
+pub type Dict(key, value)
+
+@external(javascript, "./gleam_stdlib.mjs", "get")
+pub fn get(dict: Dict(key, value), key: key) -> Result(value, Nil)
 "#
     );
 }

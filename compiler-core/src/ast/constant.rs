@@ -16,6 +16,7 @@ pub enum Constant<T, RecordTag> {
     Float {
         location: SrcSpan,
         value: EcoString,
+        float_value: LiteralFloatValue,
     },
 
     String {
@@ -38,10 +39,11 @@ pub enum Constant<T, RecordTag> {
         location: SrcSpan,
         module: Option<(EcoString, SrcSpan)>,
         name: EcoString,
-        args: Vec<CallArg<Self>>,
+        arguments: Vec<CallArg<Self>>,
         tag: RecordTag,
         type_: T,
         field_map: Option<FieldMap>,
+        record_constructor: Option<Box<ValueConstructor>>,
     },
 
     BitArray {
@@ -77,7 +79,7 @@ impl TypedConstant {
             Constant::Int { .. } => type_::int(),
             Constant::Float { .. } => type_::float(),
             Constant::String { .. } | Constant::StringConcatenation { .. } => type_::string(),
-            Constant::BitArray { .. } => type_::bits(),
+            Constant::BitArray { .. } => type_::bit_array(),
             Constant::Tuple { elements, .. } => {
                 type_::tuple(elements.iter().map(|element| element.type_()).collect())
             }
@@ -85,6 +87,94 @@ impl TypedConstant {
             | Constant::Record { type_, .. }
             | Constant::Var { type_, .. }
             | Constant::Invalid { type_, .. } => type_.clone(),
+        }
+    }
+
+    pub fn find_node(&self, byte_index: u32) -> Option<Located<'_>> {
+        if !self.location().contains(byte_index) {
+            return None;
+        }
+        Some(match self {
+            Constant::Int { .. }
+            | Constant::Float { .. }
+            | Constant::String { .. }
+            | Constant::Var { .. }
+            | Constant::Invalid { .. } => Located::Constant(self),
+            Constant::Tuple { elements, .. } | Constant::List { elements, .. } => elements
+                .iter()
+                .find_map(|element| element.find_node(byte_index))
+                .unwrap_or(Located::Constant(self)),
+            Constant::Record { arguments, .. } => arguments
+                .iter()
+                .find_map(|argument| argument.find_node(byte_index))
+                .unwrap_or(Located::Constant(self)),
+            Constant::BitArray { segments, .. } => segments
+                .iter()
+                .find_map(|segment| segment.find_node(byte_index))
+                .unwrap_or(Located::Constant(self)),
+            Constant::StringConcatenation { left, right, .. } => left
+                .find_node(byte_index)
+                .or_else(|| right.find_node(byte_index))
+                .unwrap_or(Located::Constant(self)),
+        })
+    }
+
+    pub fn definition_location(&self) -> Option<DefinitionLocation> {
+        match self {
+            Constant::Int { .. }
+            | Constant::Float { .. }
+            | Constant::String { .. }
+            | Constant::Tuple { .. }
+            | Constant::List { .. }
+            | Constant::BitArray { .. }
+            | Constant::StringConcatenation { .. }
+            | Constant::Invalid { .. } => None,
+            Constant::Record {
+                record_constructor: value_constructor,
+                ..
+            }
+            | Constant::Var {
+                constructor: value_constructor,
+                ..
+            } => value_constructor
+                .as_ref()
+                .map(|constructor| constructor.definition_location()),
+        }
+    }
+
+    pub(crate) fn referenced_variables(&self) -> im::HashSet<&EcoString> {
+        match self {
+            Constant::Var { name, .. } => im::hashset![name],
+
+            Constant::Invalid { .. }
+            | Constant::Int { .. }
+            | Constant::Float { .. }
+            | Constant::String { .. } => im::hashset![],
+
+            Constant::List { elements, .. } | Constant::Tuple { elements, .. } => elements
+                .iter()
+                .map(|element| element.referenced_variables())
+                .fold(im::hashset![], im::HashSet::union),
+
+            Constant::Record { arguments, .. } => arguments
+                .iter()
+                .map(|argument| argument.value.referenced_variables())
+                .fold(im::hashset![], im::HashSet::union),
+
+            Constant::BitArray { segments, .. } => segments
+                .iter()
+                .map(|segment| {
+                    segment
+                        .options
+                        .iter()
+                        .map(|option| option.referenced_variables())
+                        .fold(segment.value.referenced_variables(), im::HashSet::union)
+                })
+                .fold(im::hashset![], im::HashSet::union),
+
+            Constant::StringConcatenation { left, right, .. } => left
+                .referenced_variables()
+                .union(right.referenced_variables()),
         }
     }
 }
@@ -111,11 +201,21 @@ impl<A, B> Constant<A, B> {
         }
     }
 
-    pub fn is_simple(&self) -> bool {
-        matches!(
-            self,
-            Self::Int { .. } | Self::Float { .. } | Self::String { .. }
-        )
+    #[must_use]
+    pub fn can_have_multiple_per_line(&self) -> bool {
+        match self {
+            Constant::Int { .. }
+            | Constant::Float { .. }
+            | Constant::String { .. }
+            | Constant::Var { .. } => true,
+
+            Constant::Tuple { .. }
+            | Constant::List { .. }
+            | Constant::Record { .. }
+            | Constant::BitArray { .. }
+            | Constant::StringConcatenation { .. }
+            | Constant::Invalid { .. } => false,
+        }
     }
 }
 
@@ -125,13 +225,12 @@ impl<A, B> HasLocation for Constant<A, B> {
     }
 }
 
-impl<A, B> crate::bit_array::GetLiteralValue for Constant<A, B> {
-    fn as_int_literal(&self) -> Option<i64> {
-        if let Constant::Int { value, .. } = self {
-            if let Ok(val) = value.parse::<i64>() {
-                return Some(val);
-            }
+impl<A, B> bit_array::GetLiteralValue for Constant<A, B> {
+    fn as_int_literal(&self) -> Option<BigInt> {
+        if let Constant::Int { int_value, .. } = self {
+            Some(int_value.clone())
+        } else {
+            None
         }
-        None
     }
 }

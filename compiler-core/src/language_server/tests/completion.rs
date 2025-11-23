@@ -1256,6 +1256,39 @@ pub fn test_helper() {
 }
 
 #[test]
+fn completions_for_an_import_while_in_dev() {
+    let code = "import gleam
+
+pub fn main() {
+  0
+}";
+    let dev_helper = "
+pub fn dev_helper() {
+  0
+}
+";
+
+    let position = Position::new(0, 12);
+    let (mut engine, position_param) = TestProject::for_source(code)
+        .add_test_module("my_test", code)
+        .add_dev_module("my_dev_code", code)
+        .add_dev_module("dev_helper", dev_helper)
+        .positioned_with_io_in_dev(position, "my_dev_code");
+
+    let response = engine.completion(position_param, code.into());
+
+    let mut completions = response.result.unwrap().unwrap_or_default();
+    completions.sort_by(|a, b| a.label.cmp(&b.label));
+
+    let output = format!(
+        "{}\n\n----- Completion content -----\n{}",
+        show_complete(code, position),
+        format_completion_results(completions)
+    );
+    insta::assert_snapshot!(insta::internals::AutoName, output, code);
+}
+
+#[test]
 fn completions_for_an_import_with_docs() {
     let code = "import gleam
 
@@ -1350,6 +1383,41 @@ pub fn main() {
     completions.sort_by(|a, b| a.label.cmp(&b.label));
 
     assert_debug_snapshot!(completions,);
+}
+
+#[test]
+fn completions_for_an_import_not_from_dev_dependency_in_dev() {
+    let code = "import gleam
+
+pub fn main() {
+  0
+}";
+    let dev = "import gleam
+
+pub fn main() {
+  0
+}
+";
+    let dep = "";
+
+    let position = Position::new(0, 10);
+    let (mut engine, position_param) = TestProject::for_source(code)
+        .add_dev_module("my_dev_module", dev)
+        .add_hex_module("example_module", dep)
+        .add_dev_hex_module("indirect_module", "")
+        .positioned_with_io_in_dev(position, "my_dev_module");
+
+    let response = engine.completion(position_param, code.into());
+
+    let mut completions = response.result.unwrap().unwrap_or_default();
+    completions.sort_by(|a, b| a.label.cmp(&b.label));
+
+    let output = format!(
+        "{}\n\n----- Completion content -----\n{}",
+        show_complete(dev, position),
+        format_completion_results(completions)
+    );
+    insta::assert_snapshot!(insta::internals::AutoName, output, dev);
 }
 
 #[test]
@@ -1904,4 +1972,283 @@ pub fn main(something: Bool) {
         "something",
         Position::new(2, 9)
     );
+}
+
+#[test]
+fn constant() {
+    let code = "
+const hello = 10
+const world = he
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(2, 16));
+}
+
+#[test]
+fn constant_with_many_options() {
+    let code = "
+import wibble.{Wobble}
+
+type Wibble {
+  Wibble
+}
+
+const pi = 3.14159
+
+fn some_function() {
+  todo
+}
+
+const my_constant = a
+";
+
+    assert_completion!(
+        TestProject::for_source(code).add_hex_module("wibble", "pub type Wibble { Wobble Wubble }"),
+        Position::new(13, 21)
+    );
+}
+
+#[test]
+fn constant_with_module_select() {
+    let code = "
+import wibble
+
+type Wibble {
+  Wibble
+}
+
+const pi = 3.14159
+
+fn some_function() {
+  todo
+}
+
+const my_constant = wibble.W
+";
+
+    assert_completion!(
+        TestProject::for_source(code).add_hex_module(
+            "wibble",
+            "
+pub type Wibble { Wobble Wubble }
+pub const some_constant = 1
+pub fn some_function() { todo }
+"
+        ),
+        Position::new(13, 28)
+    );
+}
+
+#[test]
+fn labelled_arguments() {
+    let code = "
+pub type Wibble {
+  Wibble(wibble: Int, wobble: Float)
+}
+
+pub fn main() {
+  Wibble(w)
+}
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(6, 10));
+}
+
+#[test]
+fn labelled_arguments_with_existing_label() {
+    // This should only suggest the `wobble:` label
+    let code = "
+pub type Wibble {
+  Wibble(wibble: Int, wobble: Float)
+}
+
+pub fn main() {
+  Wibble(wibble: 10, w)
+}
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(6, 22));
+}
+
+#[test]
+fn labelled_arguments_after_label() {
+    // This should not suggest any labels, as `wibble: wibble:` is not valid syntax.
+    let code = "
+pub type Wibble {
+  Wibble(wibble: Int, wobble: Float)
+}
+
+pub fn main() {
+  Wibble(wibble: w)
+}
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(6, 18));
+}
+
+#[test]
+fn labelled_arguments_function_call() {
+    let code = "
+pub fn divide(x: Int, by y: Int) { x / y }
+
+pub fn main() {
+  divide(10, b)
+}
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(4, 14));
+}
+
+#[test]
+fn labelled_arguments_from_different_module() {
+    let code = "
+import wibble
+
+pub fn main() {
+  wibble.divide(10, b)
+}
+";
+
+    assert_completion!(
+        TestProject::for_source(code)
+            .add_hex_module("wibble", "pub fn divide(x: Int, by y: Int) { x / y }"),
+        Position::new(4, 21)
+    );
+}
+
+#[test]
+fn no_label_completions_in_nested_expression() {
+    // Since we are completing inside a list, labels are no longer available
+    let code = "
+pub type Wibble {
+  Wibble(wibble: Int, wobble: Float)
+}
+
+pub fn main() {
+  Wibble([w])
+}
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(6, 11));
+}
+
+// https://github.com/gleam-lang/gleam/issues/4625
+#[test]
+fn no_variable_completions_before_declaration_in_block() {
+    let code = "
+pub fn main() {
+  {
+    s
+    let something = 10
+  }
+}
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(3, 5));
+}
+
+// https://github.com/gleam-lang/gleam/issues/4625
+#[test]
+fn no_variable_completions_before_declaration_in_anonymous_function() {
+    let code = "
+pub fn main() {
+  fn() {
+    s
+    let something = 10
+  }
+}
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(3, 5));
+}
+
+// https://github.com/gleam-lang/gleam/issues/4625
+#[test]
+fn no_variable_completions_after_block_scope() {
+    let code = "
+pub fn main() {
+  {
+    let something = 10
+  }
+  s
+}
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(5, 3));
+}
+
+// https://github.com/gleam-lang/gleam/issues/4625
+#[test]
+fn no_variable_completions_after_anonymous_function_scope() {
+    let code = "
+pub fn main() {
+  fn() {
+    let something = 10
+  }
+  s
+}
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(5, 3));
+}
+
+// https://github.com/gleam-lang/gleam/issues/4625
+#[test]
+fn no_variable_completions_after_case_scope() {
+    let code = "
+pub fn main() {
+  case todo {
+    something -> Nil
+  }
+  s
+}
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(5, 3));
+}
+
+// https://github.com/gleam-lang/gleam/issues/4625
+#[test]
+fn no_variable_completions_after_case_clause_scope() {
+    let code = "
+pub fn main() {
+  case todo {
+    something -> Nil
+    something_else -> s
+  }
+  s
+}
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(4, 23));
+}
+
+// https://github.com/gleam-lang/gleam/issues/4625
+#[test]
+fn no_variable_completions_before_case_clause() {
+    let code = "
+pub fn main() {
+  case todo {
+    something -> s
+    something_else -> Nil
+  }
+  s
+}
+";
+
+    assert_completion!(TestProject::for_source(code), Position::new(3, 18));
+}
+
+// https://github.com/gleam-lang/gleam/issues/4652
+#[test]
+fn no_completions_in_constant_string() {
+    let code = r#"
+const x = "io."
+"#;
+
+    let completions = completion(
+        TestProject::for_source(code).add_hex_module("gleam/io", "pub fn println() {todo}"),
+        Position::new(1, 14),
+    );
+    assert_eq!(completions, vec![],);
 }

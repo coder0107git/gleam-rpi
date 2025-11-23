@@ -6,7 +6,7 @@ use lsp_types::{
 
 use super::*;
 
-fn code_actions(tester: TestProject<'_>, range: Range) -> Option<Vec<lsp_types::CodeAction>> {
+fn code_actions(tester: &TestProject<'_>, range: Range) -> Option<Vec<lsp_types::CodeAction>> {
     let position = Position {
         line: 0,
         character: 0,
@@ -26,7 +26,7 @@ fn code_actions(tester: TestProject<'_>, range: Range) -> Option<Vec<lsp_types::
 
 fn actions_with_title(
     titles: Vec<&str>,
-    tester: TestProject<'_>,
+    tester: &TestProject<'_>,
     range: Range,
 ) -> Vec<lsp_types::CodeAction> {
     code_actions(tester, range)
@@ -36,25 +36,71 @@ fn actions_with_title(
         .collect_vec()
 }
 
+fn owned_actions_with_title(
+    titles: Vec<&str>,
+    tester: TestProject<'_>,
+    range: Range,
+) -> Vec<lsp_types::CodeAction> {
+    actions_with_title(titles, &tester, range)
+}
+
 fn apply_code_action(title: &str, tester: TestProject<'_>, range: Range) -> String {
-    let src = tester.src;
     let titles = vec![title];
-    let changes = actions_with_title(titles, tester, range)
+    let changes = actions_with_title(titles, &tester, range)
         .pop()
         .expect("No action with the given title")
         .edit
         .expect("No workspace edit found")
         .changes
         .expect("No text edit found");
-    apply_code_edit(src, changes)
+    apply_code_edit(tester, changes)
 }
 
-fn apply_code_edit(src: &str, changes: HashMap<Url, Vec<lsp_types::TextEdit>>) -> String {
-    let mut result = src.to_string();
-    for (_, change) in changes {
-        result = super::apply_code_edit(result.as_str(), change);
+fn apply_code_edit(
+    tester: TestProject<'_>,
+    changes: HashMap<Url, Vec<lsp_types::TextEdit>>,
+) -> String {
+    let mut changed_files: HashMap<Url, String> = HashMap::new();
+    for (uri, change) in changes {
+        let code = match changed_files.get(&uri) {
+            Some(code) => code,
+            None => tester
+                .src_from_module_url(&uri)
+                .expect(&format!("no src for url {:?}", uri)),
+        };
+        let code = super::apply_code_edit(code, change);
+        let _ = changed_files.insert(uri, code);
     }
-    result.to_string()
+
+    show_code_edits(tester, changed_files)
+}
+
+fn show_code_edits(tester: TestProject<'_>, changed_files: HashMap<Url, String>) -> String {
+    let format_code = |url: &Url, code: &String| {
+        format!(
+            "// --- Edits applied to module '{}'\n{}",
+            tester.module_name_from_url(url).expect("a module"),
+            code
+        )
+    };
+
+    // If the file that changed is the main one we just show its code.
+    if changed_files.len() == 1 {
+        let mut changed = changed_files.iter().peekable();
+        let (url, code) = changed.peek().unwrap();
+        if tester.module_name_from_url(url) == Some("app".into()) {
+            code.to_string()
+        } else {
+            format_code(url, code)
+        }
+    } else {
+        // If more than a single file changed we want to add the name of the
+        // file before each!
+        changed_files
+            .iter()
+            .map(|(url, code)| format_code(url, code))
+            .join("\n")
+    }
 }
 
 const REMOVE_UNUSED_IMPORTS: &str = "Remove unused imports";
@@ -72,7 +118,7 @@ const EXTRACT_VARIABLE: &str = "Extract variable";
 const EXTRACT_CONSTANT: &str = "Extract constant";
 const EXPAND_FUNCTION_CAPTURE: &str = "Expand function capture";
 const GENERATE_DYNAMIC_DECODER: &str = "Generate dynamic decoder";
-const GENERATE_JSON_ENCODER: &str = "Generate JSON encoder";
+const GENERATE_TO_JSON_FUNCTION: &str = "Generate to-JSON function";
 const PATTERN_MATCH_ON_ARGUMENT: &str = "Pattern match on argument";
 const PATTERN_MATCH_ON_VARIABLE: &str = "Pattern match on variable";
 const GENERATE_FUNCTION: &str = "Generate function";
@@ -83,6 +129,13 @@ const INTERPOLATE_STRING: &str = "Interpolate string";
 const FILL_UNUSED_FIELDS: &str = "Fill unused fields";
 const REMOVE_ALL_ECHOS_FROM_THIS_MODULE: &str = "Remove all `echo`s from this module";
 const WRAP_IN_BLOCK: &str = "Wrap in block";
+const GENERATE_VARIANT: &str = "Generate variant";
+const REMOVE_BLOCK: &str = "Remove block";
+const REMOVE_OPAQUE_FROM_PRIVATE_TYPE: &str = "Remove opaque from private type";
+const COLLAPSE_NESTED_CASE: &str = "Collapse nested case";
+const REMOVE_UNREACHABLE_CLAUSES: &str = "Remove unreachable clauses";
+const ADD_OMITTED_LABELS: &str = "Add omitted labels";
+const EXTRACT_FUNCTION: &str = "Extract function";
 
 macro_rules! assert_code_action {
     ($title:expr, $code:literal, $range:expr $(,)?) => {
@@ -114,9 +167,235 @@ macro_rules! assert_no_code_actions {
         let range = $range.find_range(src);
         let all_titles = vec![$title $(, $titles)*];
         let expected: Vec<lsp_types::CodeAction> = vec![];
-        let result = actions_with_title(all_titles, $project, range);
+        let result = owned_actions_with_title(all_titles, $project, range);
         assert_eq!(expected, result);
     };
+}
+
+#[test]
+fn fix_truncated_segment_1() {
+    let name = "Replace with `1`";
+    assert_code_action!(
+        name,
+        r#"
+pub fn main() {
+  <<1, 257, 259:size(1)>>
+}"#,
+        find_position_of("257").to_selection()
+    );
+}
+
+#[test]
+fn fix_truncated_segment_2() {
+    let name = "Replace with `0`";
+    assert_code_action!(
+        name,
+        r#"
+pub fn main() {
+  <<1, 1024:size(10)>>
+}"#,
+        find_position_of("size").to_selection()
+    );
+}
+
+#[test]
+fn generate_variant_with_fields_in_same_module() {
+    assert_code_action!(
+        GENERATE_VARIANT,
+        r#"
+pub type Wibble {
+  Wibble
+}
+
+pub fn main() -> Wibble {
+  Wobble(1)
+}"#,
+        find_position_of("Wobble").to_selection()
+    );
+}
+
+#[test]
+fn generate_variant_with_no_fields_in_same_module() {
+    assert_code_action!(
+        GENERATE_VARIANT,
+        r#"
+pub type Wibble {
+  Wibble
+}
+
+pub fn main() -> Wibble {
+  Wobble
+}"#,
+        find_position_of("Wobble").to_selection()
+    );
+}
+
+#[test]
+fn generate_variant_with_labels_in_same_module() {
+    assert_code_action!(
+        GENERATE_VARIANT,
+        r#"
+pub type Wibble {
+  Wibble
+}
+
+pub fn main() -> Wibble {
+  Wobble("hello", label: 1)
+}"#,
+        find_position_of("Wobble").to_selection()
+    );
+}
+
+#[test]
+fn generate_variant_from_pattern_with_fields() {
+    assert_code_action!(
+        GENERATE_VARIANT,
+        r#"
+pub type Wibble {
+  Wibble
+}
+
+pub fn new() { Wibble }
+
+pub fn main() -> Wibble {
+  let assert Wobble(1) = new()
+}
+
+"#,
+        find_position_of("Wobble").to_selection()
+    );
+}
+
+#[test]
+fn generate_variant_from_pattern_with_labelled_fields() {
+    assert_code_action!(
+        GENERATE_VARIANT,
+        r#"
+pub type Wibble {
+  Wibble
+}
+
+pub fn new() { Wibble }
+
+pub fn main() -> Wibble {
+  let assert Wobble("hello", label: 1) = new()
+}
+
+"#,
+        find_position_of("Wobble").to_selection()
+    );
+}
+
+#[test]
+fn generate_variant_from_pattern_with_no_fields() {
+    assert_code_action!(
+        GENERATE_VARIANT,
+        r#"
+pub type Wibble {
+  Wibble
+}
+
+pub fn new() { Wibble }
+
+pub fn main() -> Wibble {
+  let assert Wobble = new()
+}
+
+"#,
+        find_position_of("Wobble").to_selection()
+    );
+}
+
+#[test]
+fn generate_unqualified_variant_in_other_module() {
+    let src = r#"
+import other
+
+pub fn main() -> other.Wibble {
+  let assert Wobble = new()
+}
+
+pub fn new() -> other.Wibble { todo }
+"#;
+
+    assert_code_action!(
+        GENERATE_VARIANT,
+        TestProject::for_source(src).add_module("other", "pub type Wibble"),
+        find_position_of("Wobble").to_selection()
+    );
+}
+
+#[test]
+fn generate_qualified_variant_in_other_module() {
+    let src = r#"
+import other
+
+pub fn main() -> other.Wibble {
+  let assert other.Wobble = new()
+}
+
+pub fn new() -> other.Wibble { todo }
+"#;
+    assert_code_action!(
+        GENERATE_VARIANT,
+        TestProject::for_source(src).add_module("other", "pub type Wibble"),
+        find_position_of("Wobble").to_selection()
+    );
+}
+
+#[test]
+fn do_not_generate_variant_if_one_with_the_same_name_exists() {
+    assert_no_code_actions!(
+        GENERATE_VARIANT,
+        r#"
+pub fn main() -> Wibble {
+  let assert Wobble = new()
+}
+
+pub type Wibble {
+  Wobble(n: Int)
+}
+
+pub fn new() -> Wibble { todo }
+"#,
+        find_position_of("Wobble").to_selection()
+    );
+}
+
+#[test]
+fn do_not_generate_variant_if_one_with_the_same_name_exists_in_other_module() {
+    let src = r#"
+import other.{type Wibble}
+
+pub fn main() -> Wibble {
+  let assert Wobble = new()
+}
+
+pub fn new() -> Wibble { todo }
+"#;
+    assert_no_code_actions!(
+        GENERATE_VARIANT,
+        TestProject::for_source(src).add_module("other", "pub type Wibble { Wobble(String) }"),
+        find_position_of("Wobble").to_selection()
+    );
+}
+
+#[test]
+fn do_not_generate_qualified_variant_if_one_with_the_same_name_exists_in_other_module() {
+    let src = r#"
+import other.{type Wibble}
+
+pub fn main() -> Wibble {
+  let assert other.Wobble = new()
+}
+
+pub fn new() -> Wibble { todo }
+"#;
+    assert_no_code_actions!(
+        GENERATE_VARIANT,
+        TestProject::for_source(src).add_module("other", "pub type Wibble { Wobble(String) }"),
+        find_position_of("Wobble").to_selection()
+    );
 }
 
 #[test]
@@ -215,6 +494,58 @@ fn remove_echo() {
 }
 
 #[test]
+fn remove_echo_with_message() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  echo 1 + 2 as "message"
+}"#,
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_with_message_and_comment() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  echo 1 + 2
+    // Hello!
+    as "message"
+}"#,
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_with_message_and_comment_2() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  echo 1 + 2 as
+    // Hello!
+    "message"
+}"#,
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_with_message_and_comment_3() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  echo 1 + 2 as
+    // Hello!
+    "message"
+
+  Nil
+}"#,
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
 fn remove_echo_selecting_expression() {
     assert_code_action!(
         REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
@@ -222,6 +553,17 @@ fn remove_echo_selecting_expression() {
   echo 1 + 2
 }",
         find_position_of("1").select_until(find_position_of("2"))
+    );
+}
+
+#[test]
+fn remove_echo_selecting_message() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  echo 1 + 2 as "message"
+}"#,
+        find_position_of("message").to_selection()
     );
 }
 
@@ -250,12 +592,36 @@ fn remove_echo_in_pipeline_step() {
 }
 
 #[test]
+fn remove_echo_in_pipeline_step_with_message() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  [1, 2, 3]
+  |> echo as message
+  |> wibble
+}"#,
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
 fn remove_echo_in_single_line_pipeline_step() {
     assert_code_action!(
         REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
         "pub fn main() {
   [1, 2, 3] |> echo |> wibble
 }",
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_in_single_line_pipeline_step_with_message() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  [1, 2, 3] |> echo as "message" |> wibble
+}"#,
         find_position_of("echo").to_selection()
     );
 }
@@ -274,6 +640,19 @@ fn remove_echo_last_in_long_pipeline_step() {
 }
 
 #[test]
+fn remove_echo_last_in_long_pipeline_step_with_message() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  [1, 2, 3]
+  |> wibble
+  |> echo as "message"
+}"#,
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
 fn remove_echo_last_in_short_pipeline_step() {
     assert_code_action!(
         REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
@@ -281,6 +660,18 @@ fn remove_echo_last_in_short_pipeline_step() {
   [1, 2, 3]
   |> echo
 }",
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_last_in_short_pipeline_step_with_message() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  [1, 2, 3]
+  |> echo as "message"
+}"#,
         find_position_of("echo").to_selection()
     );
 }
@@ -328,6 +719,134 @@ fn remove_echo_removes_all_echos_1() {
   echo 1
 }",
         find_position_of("echo").nth_occurrence(2).to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_removes_entire_echo_statement_used_with_literals() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        "pub fn main() {
+  echo 1
+  Nil
+}",
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_removes_entire_echo_statement_used_with_literals_and_message() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  echo 1 as "message"
+  Nil
+}"#,
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_removes_entire_echo_statement_used_with_a_var() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        "pub fn main() {
+  let a = 1
+  echo a
+  Nil
+}",
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_removes_multiple_entire_echo_statement_used_with_literals() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  echo 1
+  echo "wibble"
+  Nil
+}"#,
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_removes_multiple_entire_echo_statement_used_with_literals_but_stops_at_comments() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  echo 1
+
+  // Oh no I hope I'm not deleted by the code action!!
+  Nil
+}"#,
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_removes_entire_echo_statement_used_with_literals_in_a_fn() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        "pub fn main() {
+  fn() {
+    echo 1
+    Nil
+  }
+}",
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_removes_multiple_entire_echo_statement_used_with_literals_in_a_fn() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  fn() {
+    echo 1
+    echo "wibble"
+    Nil
+  }
+}"#,
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_removes_does_not_remove_entire_echo_statement_if_its_the_return() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        "pub fn main() {
+  echo 1
+}",
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_with_message_removes_does_not_remove_entire_echo_statement_if_its_the_return() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  echo 1 as "message"
+}"#,
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn remove_echo_removes_does_not_remove_entire_echo_statement_if_its_the_return_of_a_fn() {
+    assert_code_action!(
+        REMOVE_ALL_ECHOS_FROM_THIS_MODULE,
+        r#"pub fn main() {
+  fn() {
+    echo 1
+  }
+}"#,
+        find_position_of("echo").to_selection()
     );
 }
 
@@ -488,6 +1007,125 @@ pub fn main() {
         TestProject::for_source(src)
             .add_hex_module("result", "pub fn is_ok() {}")
             .add_hex_module("option", ""),
+        find_position_of("// test").select_until(find_position_of("pub")),
+    );
+}
+
+#[test]
+fn test_remove_unused_value() {
+    let src = "
+// test
+import result.{is_ok}
+import option
+
+pub fn main() {
+  result.is_ok
+}
+";
+    assert_code_action!(
+        REMOVE_UNUSED_IMPORTS,
+        TestProject::for_source(src)
+            .add_hex_module("result", "pub fn is_ok() {}")
+            .add_hex_module("option", ""),
+        find_position_of("// test").select_until(find_position_of("pub")),
+    );
+}
+
+#[test]
+fn test_remove_aliased_unused_value() {
+    let src = "
+// test
+import result.{is_ok as ok}
+import option
+
+pub fn main() {
+  result.is_ok
+}
+";
+    assert_code_action!(
+        REMOVE_UNUSED_IMPORTS,
+        TestProject::for_source(src)
+            .add_hex_module("result", "pub fn is_ok() {}")
+            .add_hex_module("option", ""),
+        find_position_of("// test").select_until(find_position_of("pub")),
+    );
+}
+
+#[test]
+fn test_remove_multiple_unused_values() {
+    let src = "
+// test
+import result.{type Unused, used, unused, unused_again, type Used, used_again}
+
+pub fn main(x: Used) {
+  #(used, used_again)
+}
+";
+    assert_code_action!(
+        REMOVE_UNUSED_IMPORTS,
+        TestProject::for_source(src).add_hex_module(
+            "result",
+            "
+pub const used = 1
+pub const unused = 2
+pub const unused_again = 3
+pub const used_again = 4
+pub type Unused
+pub type Used
+"
+        ),
+        find_position_of("// test").select_until(find_position_of("pub")),
+    );
+}
+
+#[test]
+fn test_remove_multiple_unused_values_2() {
+    let src = "
+// test
+import result.{type Unused, used, unused, type Used, unused_again}
+
+pub fn main(x: Used) {
+  used
+}
+";
+    assert_code_action!(
+        REMOVE_UNUSED_IMPORTS,
+        TestProject::for_source(src).add_hex_module(
+            "result",
+            "
+pub const used = 1
+pub const unused = 2
+pub const unused_again = 3
+pub type Unused
+pub type Used
+"
+        ),
+        find_position_of("// test").select_until(find_position_of("pub")),
+    );
+}
+
+#[test]
+fn test_remove_entire_unused_import() {
+    let src = "
+// test
+import result.{unused, unused_again}
+
+pub fn main() {
+  todo
+}
+";
+    assert_code_action!(
+        REMOVE_UNUSED_IMPORTS,
+        TestProject::for_source(src).add_hex_module(
+            "result",
+            "
+pub const used = 1
+pub const unused = 2
+pub const unused_again = 3
+pub type Unused
+pub type Used
+"
+        ),
         find_position_of("// test").select_until(find_position_of("pub")),
     );
 }
@@ -1158,6 +1796,22 @@ pub fn main() {
 }
 
 #[test]
+fn test_convert_assert_does_not_appear_if_the_entire_module_is_selected() {
+    assert_no_code_actions!(
+        CONVERT_TO_CASE,
+        "
+pub type Wibble { Wibble(arg: Int, arg2: Float) }
+pub fn main() {
+  let assert Wibble(arg2:, ..) = Wibble(arg: 1, arg2: 1.0)
+  let assert Wibble(arg2:, ..) = Wibble(arg: 1, arg2: 1.0)
+}
+// end
+",
+        find_position_of("pub").select_until(find_position_of("// end")),
+    );
+}
+
+#[test]
 fn label_shorthand_action_works_on_labelled_call_args() {
     assert_code_action!(
         USE_LABEL_SHORTHAND_SYNTAX,
@@ -1330,6 +1984,51 @@ pub fn main() {
 pub type Wibble { Wibble(arg1: Int, arg2: String) }
  "#,
         find_position_of("Wibble").select_until(find_position_of("Wibble()").under_last_char()),
+    );
+}
+
+#[test]
+fn fill_in_labelled_args_works_with_pattern_and_no_parentheses() {
+    assert_code_action!(
+        FILL_LABELS,
+        r#"
+pub fn main() {
+  let assert Ok(Wibble) = Wibble(1, "2")
+}
+
+pub type Wibble { Wibble(arg1: Int, arg2: String) }
+ "#,
+        find_position_of("Wibble").select_until(find_position_of("Wibble").under_last_char()),
+    );
+}
+
+#[test]
+fn fill_in_labelled_args_works_with_pattern_and_parentheses() {
+    assert_code_action!(
+        FILL_LABELS,
+        r#"
+pub fn main() {
+  let assert Ok(Wibble()) = Wibble(1, "2")
+}
+
+pub type Wibble { Wibble(arg1: Int, arg2: String) }
+ "#,
+        find_position_of("Wibble").select_until(find_position_of("Wibble").under_last_char()),
+    );
+}
+
+#[test]
+fn fill_in_labelled_args_works_with_pattern_and_parentheses_with_spaces() {
+    assert_code_action!(
+        FILL_LABELS,
+        r#"
+pub fn main() {
+  let assert Ok(Wibble   ()) = Wibble(1, "2")
+}
+
+pub type Wibble { Wibble(arg1: Int, arg2: String) }
+ "#,
+        find_position_of("Wibble").select_until(find_position_of("Wibble").under_last_char()),
     );
 }
 
@@ -1507,11 +2206,12 @@ fn test_assign_unused_result() {
         ASSIGN_UNUSED_RESULT,
         r#"
 pub fn main() {
-    Ok(0)
+    let x = 1
+    Ok(x)
     Nil
 }
 "#,
-        find_position_of("Ok").select_until(find_position_of("(0)")),
+        find_position_of("Ok").select_until(find_position_of("(x)")),
     );
 }
 
@@ -1522,13 +2222,14 @@ fn test_assign_unused_result_in_block() {
         r#"
 pub fn main() {
     {
-        Ok(0)
+        let x = 1
+        Ok(x)
         Nil
     }
     Nil
 }
 "#,
-        find_position_of("Ok").select_until(find_position_of("(0)")),
+        find_position_of("Ok").select_until(find_position_of("(x)")),
     );
 }
 
@@ -1539,8 +2240,9 @@ fn test_assign_unused_result_on_block_start() {
         r#"
 pub fn main() {
     {
-        Ok(0)
-        Ok(0)
+        let x = 1
+        Ok(x)
+        Ok(x)
     }
     Nil
 }
@@ -1556,8 +2258,9 @@ fn test_assign_unused_result_on_block_end() {
         r#"
 pub fn main() {
     {
-        Ok(0)
-        Ok(0)
+        let x = 1
+        Ok(x)
+        Ok(x)
     }
     Nil
 }
@@ -1574,12 +2277,13 @@ fn test_assign_unused_result_inside_block() {
         r#"
 pub fn main() {
     {
+        let x = 1
         Nil
-        Ok(1)
+        Ok(x)
     }
 }
 "#,
-        find_position_of("Ok").select_until(find_position_of("(1)"))
+        find_position_of("Ok").select_until(find_position_of("(x)"))
     );
 }
 
@@ -1589,12 +2293,13 @@ fn test_assign_unused_result_only_first_action() {
         ASSIGN_UNUSED_RESULT,
         r#"
 pub fn main() {
-    Ok(0)
-    Ok(1)
+    let x = 1
+    Ok(x)
+    Ok(x)
     Nil
 }
 "#,
-        find_position_of("Ok").select_until(find_position_of("(0)"))
+        find_position_of("Ok").select_until(find_position_of("(x)"))
     );
 }
 
@@ -1605,10 +2310,11 @@ fn test_assign_unused_result_not_on_return_value() {
         ASSIGN_UNUSED_RESULT,
         r#"
 pub fn main() {
-    Ok(0)
+    let x = 1
+    Ok(x)
 }
 "#,
-        find_position_of("Ok").select_until(find_position_of("(0)"))
+        find_position_of("Ok").select_until(find_position_of("(x)"))
     );
 }
 
@@ -1620,11 +2326,12 @@ fn test_assign_unused_result_not_on_return_value_in_block() {
         r#"
 pub fn main() {
     let _ = {
-        Ok(0)
+        let x = 1
+        Ok(x)
     }
     Nil
 }"#,
-        find_position_of("Ok").select_until(find_position_of("(0)"))
+        find_position_of("Ok").select_until(find_position_of("(x)"))
     );
 }
 
@@ -2310,6 +3017,24 @@ pub fn main() {
 }
 
 #[test]
+fn add_annotation_triggers_on_function_curly_brace() {
+    assert_code_action!(
+        ADD_ANNOTATION,
+        "pub fn main() { 1 }",
+        find_position_of("{").to_selection(),
+    );
+}
+
+#[test]
+fn add_annotation_triggers_on_empty_space_before_function_curly_brace() {
+    assert_code_action!(
+        ADD_ANNOTATION,
+        "pub fn main() { 1 }",
+        find_position_of(" ").nth_occurrence(3).to_selection(),
+    );
+}
+
+#[test]
 fn adding_annotations_prints_contextual_types4() {
     let src = r#"
 import wibble as wobble
@@ -2408,6 +3133,22 @@ pub fn main() {
         "Unqualify wobble.Wibble",
         TestProject::for_source(src).add_hex_module("wobble", "pub type Wobble { Wibble }"),
         find_position_of(".W").select_until(find_position_of("ibble"))
+    );
+}
+
+#[test]
+fn test_qualified_to_unqualified_import_custom_type_record_declaration() {
+    let src = r#"
+import wobble
+
+pub type Wibble {
+  Wibble(wibble: wobble.Wobble)
+}
+"#;
+    assert_code_action!(
+        "Unqualify wobble.Wobble",
+        TestProject::for_source(src).add_hex_module("wobble", "pub type Wobble { Wibble }"),
+        find_position_of(".").select_until(find_position_of("Wobble"))
     );
 }
 
@@ -2781,6 +3522,57 @@ pub fn main(x) -> option.Option(wobble.Wibble) {
             .add_hex_module("option", "pub type Option(v) { Some(v) None }")
             .add_hex_module("wobble", "pub type Wibble { Wobble(Int) }"),
         find_position_of("wobble.").select_until(find_position_of("Wibble")),
+    );
+}
+
+#[test]
+fn test_qualified_to_unqualified_aliased_type() {
+    let src = r#"
+import wobble
+
+pub fn main(x) -> wobble.Wibble(a) {
+    todo
+}
+"#;
+    assert_code_action!(
+        "Unqualify wobble.Wibble",
+        TestProject::for_source(src).add_hex_module("wobble", "pub type Wibble(a) = List(a)"),
+        find_position_of("wobble.").select_until(find_position_of("Wibble")),
+    );
+}
+
+#[test]
+fn test_qualified_to_unqualified_aliased_type_with_multiple_imports() {
+    let src = r#"
+import other/wobble as other
+import wibble/wobble
+
+pub fn main(x) -> wobble.Wibble(a) {
+    todo
+}
+"#;
+    assert_code_action!(
+        "Unqualify wobble.Wibble",
+        TestProject::for_source(src)
+            .add_hex_module("wibble/wobble", "pub type Wibble(a) = List(a)")
+            .add_hex_module("other/wobble", "pub type Wibble(a) = List(a)"),
+        find_position_of("wobble.").select_until(find_position_of("Wibble")),
+    );
+}
+
+#[test]
+fn test_qualified_aliased_to_unqualified_aliased_type() {
+    let src = r#"
+import wobble as wob
+
+pub fn main(x) -> wob.Wibble(a) {
+    todo
+}
+"#;
+    assert_code_action!(
+        "Unqualify wob.Wibble",
+        TestProject::for_source(src).add_hex_module("wobble", "pub type Wibble(a) = List(a)"),
+        find_position_of("wob.").select_until(find_position_of("Wibble")),
     );
 }
 
@@ -3548,6 +4340,37 @@ pub fn main() {
             .select_until(find_position_of("(1)")),
     );
 }
+
+#[test]
+fn test_unqualified_to_qualified_import_variable_shadowing() {
+    let src = r#"
+
+import wibble.{wobble}
+
+pub fn example() {
+  echo wobble
+
+  let wobble = 1
+
+  echo wobble
+
+  let _ = fn(wobble) {
+    echo wobble
+  }
+
+  todo
+}
+"#;
+
+    assert_code_action!(
+        "Qualify wobble as wibble.wobble",
+        TestProject::for_source(src).add_hex_module("wibble", "pub fn wobble() { todo }"),
+        find_position_of("wob")
+            .nth_occurrence(2)
+            .select_until(find_position_of("ble").nth_occurrence(3))
+    );
+}
+
 /* TODO: implement qualified unused location
 #[test]
 fn test_remove_unused_qualified_action() {
@@ -4207,6 +5030,24 @@ pub fn main() {
 }
 
 #[test]
+// https://github.com/gleam-lang/gleam/issues/4498
+fn turn_call_into_use_with_out_of_order_arguments() {
+    assert_code_action!(
+        CONVERT_TO_USE,
+        r#"
+pub fn main() {
+  fold(0, over: [], with: fn (a, b) { todo })
+}
+
+fn fold(over list: List(a), from acc: acc, with fun: fn(acc, a) -> acc) -> acc {
+  todo
+}
+"#,
+        find_position_of("fold").to_selection(),
+    );
+}
+
+#[test]
 fn inexhaustive_let_result_to_case() {
     assert_code_action!(
         CONVERT_TO_CASE,
@@ -4387,17 +5228,195 @@ fn extract_variable_does_not_extract_a_variable() {
 }
 
 #[test]
-fn extract_variable_does_not_extract_an_entire_pipeline_step() {
+fn extract_variable_does_not_extract_top_level_statement() {
     assert_no_code_actions!(
         EXTRACT_VARIABLE,
         r#"pub fn main() {
+  let wibble = 1
+}"#,
+        find_position_of("1").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_does_not_extract_top_level_statement_inside_block() {
+    assert_no_code_actions!(
+        EXTRACT_VARIABLE,
+        r#"pub fn main() {
+  let x = {
+    let y = "y"
+    let w = "w" <> y
+    w
+  }
+}"#,
+        find_position_of("y").nth_occurrence(2).to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_does_not_extract_top_level_statement_inside_use() {
+    assert_no_code_actions!(
+        EXTRACT_VARIABLE,
+        "
+pub fn main() {
+  use x <- try(Ok(1))
+  let y = 2
+  Ok(y + x)
+}
+pub fn try(result: Result(a, e), fun: fn(a) -> Result(b, e)) -> Result(b, e) { todo }
+",
+        find_position_of("2").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_does_not_extract_use() {
+    assert_no_code_actions!(
+        EXTRACT_VARIABLE,
+        "
+pub fn main() {
+  use x <- try(Ok(1))
+  Ok(x)
+}
+pub fn try(result: Result(a, e), fun: fn(a) -> Result(b, e)) -> Result(b, e) { todo }
+",
+        find_position_of("use").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_does_not_extract_panic() {
+    assert_no_code_actions!(
+        EXTRACT_VARIABLE,
+        r#"pub fn main() {
+  let x = 1
+  panic
+}"#,
+        find_position_of("panic").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_does_not_extract_echo() {
+    assert_no_code_actions!(
+        EXTRACT_VARIABLE,
+        r#"pub fn main() {
+  let x = 1
+  echo x
+}"#,
+        find_position_of("echo").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_does_not_extract_assignment() {
+    assert_no_code_actions!(
+        EXTRACT_VARIABLE,
+        r#"pub fn main() {
+  let x = 1
+}"#,
+        find_position_of("x").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_does_not_extract_record_variable_in_record_update() {
+    assert_no_code_actions!(
+        EXTRACT_VARIABLE,
+        r#"
+type Wibble { Wibble(one: Int, two: Int) }
+
+pub fn main() {
+  let wibble = todo
+  Wibble(..wibble, one: 1)
+}"#,
+        find_position_of("wibble").nth_occurrence(2).to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_from_arg_in_pipelined_call() {
+    assert_code_action!(
+        EXTRACT_VARIABLE,
+        "
+pub fn main() {
+  let adder = add
+  let x = [4, 5, 6] |> map2([1, 2, 3], adder)
+  x
+}
+pub fn map2(list1: List(a), list2: List(b), fun: fn(a, b) -> c) -> List(c) { todo }
+pub fn add(a: Int, b: Int) -> Int { todo }
+",
+        find_position_of("[1").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_from_arg_in_pipelined_call_to_capture() {
+    assert_code_action!(
+        EXTRACT_VARIABLE,
+        "
+pub fn main() {
+  let adder = add
+  let x = adder |> reduce([1, 2, 3], _)
+  x
+}
+pub fn reduce(list: List(a), fun: fn(a, a) -> a) -> Result(a, Nil) { todo }
+pub fn add(a: Int, b: Int) -> Int { todo }
+",
+        find_position_of("[1").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_from_arg_in_pipelined_call_of_function_to_capture() {
+    assert_code_action!(
+        EXTRACT_VARIABLE,
+        "
+pub fn main() {
+  fn(total, item) { total + item }
+  |> fold(with: _, from: 0, over: [1, 2, 3])
+}
+pub fn fold(over l: List(a), from i: t, with f: fn(t, a) -> t) -> acc { todo }
+",
+        find_position_of("fold").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_from_arg_in_nested_function_called_in_pipeline() {
+    assert_code_action!(
+        EXTRACT_VARIABLE,
+        "
+pub fn main() {
+  let result =
     [1, 2, 3]
-    |> map(todo)
-    |> map(todo)
+    |> map(add(_, 1))
+    |> map(subtract(_, 9))
+
+  result
+}
+pub fn map(list: List(a), fun: fn(a) -> b) -> List(b) { todo }
+pub fn add(a: Int, b: Int) -> Int { todo }
+pub fn subtract(a: Int, b: Int) -> Int { todo }
+",
+        find_position_of("9").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_does_not_extract_an_entire_pipeline_step() {
+    assert_no_code_actions!(
+        EXTRACT_VARIABLE,
+        "
+pub fn main() {
+  [1, 2, 3]
+  |> map(todo)
+  |> map(todo)
 }
 
 fn map(list, fun) { todo }
-"#,
+",
         find_position_of("map").to_selection()
     );
 }
@@ -4420,20 +5439,16 @@ fn map(list, fun) { todo }
 
 #[test]
 fn extract_variable_2() {
-    let src = r#"
-import gleam/list
-import gleam/int
-
-pub fn main() {
-  list.map([1, 2, 3], int.add(1, _))
-}"#;
-
     assert_code_action!(
         EXTRACT_VARIABLE,
-        TestProject::for_source(src)
-            .add_module("gleam/int", "pub fn add(n, m) { todo }")
-            .add_module("gleam/list", "pub fn map(l, f) { todo }"),
-        find_position_of("int.").select_until(find_position_of("add"))
+        "
+pub fn main() {
+  map([1, 2, 3], add(1, _))
+}
+pub fn add(n, m) { todo }
+pub fn map(l, f) { todo }
+",
+        find_position_of("add").to_selection()
     );
 }
 
@@ -4518,6 +5533,34 @@ fn extract_variable_in_multiline_case_subject_branch() {
 }
 
 #[test]
+fn extract_variable_in_case_branch_using_var() {
+    assert_code_action!(
+        EXTRACT_VARIABLE,
+        r#"pub fn main() {
+  case todo {
+    Ok(value) -> 2 * value + 1
+    Error(_) -> panic
+  }
+}"#,
+        find_position_of("2").select_until(find_position_of("value").nth_occurrence(2))
+    );
+}
+
+#[test]
+fn extract_variable_in_case_branch_from_second_arg() {
+    assert_code_action!(
+        EXTRACT_VARIABLE,
+        r#"pub fn main() {
+  case todo {
+    Ok(_) -> #(Ok(1), Error("s"))
+    Error(_) -> panic
+  }
+}"#,
+        find_position_of("E").to_selection()
+    );
+}
+
+#[test]
 fn extract_variable_in_use() {
     assert_code_action!(
         EXTRACT_VARIABLE,
@@ -4557,6 +5600,72 @@ fn extract_variable_in_multiline_use() {
 }
 
 #[test]
+fn extract_variable_after_nested_anonymous_function() {
+    assert_code_action!(
+        EXTRACT_VARIABLE,
+        r#"pub fn main() {
+    let f = fn() {
+        let x = 1 + 2
+        let ff = fn() {
+            let y = x + 3
+            let z = y + x
+            z
+        }
+        let z = x * 4
+        z
+    }
+    let y = 5 + 6
+    f()
+}"#,
+        find_position_of("6").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_in_nested_anonymous_function() {
+    assert_code_action!(
+        EXTRACT_VARIABLE,
+        r#"pub fn main() {
+    let f = fn() {
+        let x = 1 + 2
+        let ff = fn() {
+            let y = x + 3
+            let z = y + x
+            z
+        }
+        let z = x * 4
+        z
+    }
+    let y = 5 + 6
+    f()
+}"#,
+        find_position_of("4").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_in_double_nested_anonymous_function() {
+    assert_code_action!(
+        EXTRACT_VARIABLE,
+        r#"pub fn main() {
+    let f = fn() {
+        let x = 1 + 2
+        let ff = fn() {
+            let y = x + 3
+            let z = y + x
+            z
+        }
+        let z = x * 4
+        z
+    }
+    let y = 5 + 6
+    f()
+}"#,
+        find_position_of("3").to_selection()
+    );
+}
+
+#[test]
 fn extract_variable_in_block() {
     assert_code_action!(
         EXTRACT_VARIABLE,
@@ -4568,6 +5677,52 @@ fn extract_variable_in_block() {
   }
 }"#,
         find_position_of("2").select_until(find_position_of("3"))
+    );
+}
+
+#[test]
+fn extract_variable_and_dont_shadow_existing_variable_in_operator() {
+    let src = "import gleam/int
+import random_import as int_2
+
+const int_3 = 3
+
+fn int_4() { 4 }
+
+fn isolated_scope() {
+    let int_6 = 6
+    int_6 + 1
+}
+
+pub fn main() {
+  let int_5 = 5
+  let result = int_5 + 6
+  result
+}
+";
+
+    assert_code_action!(
+        EXTRACT_VARIABLE,
+        TestProject::for_source(src)
+            .add_hex_module("gleam/int", "")
+            .add_hex_module("random_import", ""),
+        find_position_of("6").nth_occurrence(4).to_selection(),
+    );
+}
+
+#[test]
+fn extract_variable_and_dont_shadow_existing_variable_in_argument() {
+    assert_code_action!(
+        EXTRACT_VARIABLE,
+        r#"fn wibble(a, b) {
+  a + b
+}
+
+fn main() {
+  let int = 1
+  wibble(int, 2)
+}"#,
+        find_position_of("2").to_selection()
     );
 }
 
@@ -5974,6 +7129,129 @@ pub fn main() {
 }
 
 #[test]
+fn pattern_match_on_clause_variable() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "
+pub fn main() {
+  case maybe_wibble() {
+    Ok(something) -> 1
+    Error(_) -> 2
+  }
+}
+
+type Wibble {
+  Wobble
+  Woo
+}
+
+fn maybe_wibble() { Ok(Wobble) }
+
+",
+        find_position_of("something").to_selection()
+    );
+}
+
+#[test]
+fn pattern_match_on_clause_variable_with_label() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "
+pub fn main() {
+  case wibble() {
+    Wobble(wibble: something) -> 1
+    _ -> 2
+  }
+}
+
+type Wibble {
+  Wobble(wibble: Wibble)
+  Woo
+}
+
+fn new() { Wobble }
+
+",
+        find_position_of("something").to_selection()
+    );
+}
+
+#[test]
+fn pattern_match_on_clause_variable_with_label_shorthand() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "
+pub fn main() {
+  case new() {
+    Wobble(wibble:) -> 1
+    _ -> 2
+  }
+}
+
+type Wibble {
+  Wobble(wibble: Wibble)
+  Woo
+}
+
+fn new() { Wobble }
+
+",
+        find_position_of("wibble").to_selection()
+    );
+}
+
+#[test]
+fn pattern_match_on_clause_variable_nested_pattern() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "
+pub fn main() {
+  case maybe_wibble() {
+    Ok(Wobble(something)) -> 1
+    Error(_) -> 2
+  }
+}
+
+type Wibble {
+  Wobble(Wibble)
+  Woo
+}
+
+fn maybe_wibble() { Ok(Woo) }
+
+",
+        find_position_of("something").to_selection()
+    );
+}
+
+#[test]
+fn pattern_match_on_clause_variable_with_block_body() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "
+pub fn main() {
+  case maybe_wibble() {
+    Ok(something) -> {
+      1
+      2
+    }
+    Error(_) -> 2
+  }
+}
+
+type Wibble {
+  Wobble
+  Woo
+}
+
+fn maybe_wibble() { Ok(Wobble) }
+
+",
+        find_position_of("something").to_selection()
+    );
+}
+
+#[test]
 fn pattern_match_on_argument_will_use_qualified_name() {
     let src = "
 import wibble
@@ -6176,6 +7454,56 @@ pub fn main() {
 }
 
 #[test]
+fn pattern_match_on_use_assignment() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "
+pub fn main() {
+  use var <- f
+}
+
+fn f(g) { g(#(1, 2)) }
+",
+        find_position_of("var").to_selection()
+    );
+}
+
+#[test]
+fn pattern_match_on_use_assignment_with_multiple_constructors() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "
+pub type Wibble {
+  Wobble
+  Woo
+}
+
+pub fn main() {
+  use var <- f
+}
+
+fn f(g) { g(Wobble) }
+",
+        find_position_of("var").to_selection()
+    );
+}
+
+#[test]
+fn pattern_match_on_pattern_use_assignment() {
+    assert_no_code_actions!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "
+pub fn main() {
+  use #(a, b) <- f
+}
+
+fn f(g) { g(#(1, 2)) }
+",
+        find_position_of("#").to_selection()
+    );
+}
+
+#[test]
 fn pattern_match_on_argument_works_on_fn_arguments() {
     assert_code_action!(
         PATTERN_MATCH_ON_ARGUMENT,
@@ -6207,6 +7535,33 @@ pub fn main() {
 fn map(list: List(a), fun: fn(a) -> b) { todo }
 ",
         find_position_of("tuple").to_selection()
+    );
+}
+
+#[test]
+// https://github.com/gleam-lang/gleam/issues/5042
+fn pattern_match_on_variable_crashes() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        r#"
+pub type Wibble {
+    Wibble(Wobble)
+}
+
+pub type Wobble {
+    Wobble
+    Wubble
+}
+
+pub fn main() {
+    let Wibble(wobble) = todo
+
+    case todo {
+      _ -> todo
+    }
+}
+"#,
+        find_position_of("wobble").to_selection()
     );
 }
 
@@ -6361,6 +7716,49 @@ pub fn main() {
 }
 
 #[test]
+fn generate_function_labels_and_arguments_can_share_the_same_name() {
+    assert_code_action!(
+        GENERATE_FUNCTION,
+        "
+pub fn main() {
+  let wibble = 10
+  wubble(wibble, wibble: 14)
+}
+",
+        find_position_of("wubble").to_selection()
+    );
+}
+
+#[test]
+fn generate_function_arguments_with_same_name_get_renamed() {
+    assert_code_action!(
+        GENERATE_FUNCTION,
+        "
+pub fn main() {
+  let wibble = 10
+  wubble(wibble, wibble)
+}
+",
+        find_position_of("wubble").to_selection()
+    );
+}
+
+#[test]
+fn generate_function_arguments_with_labels_and_variables_uses_different_names() {
+    assert_code_action!(
+        GENERATE_FUNCTION,
+        "
+pub fn main() {
+  let list = [2, 4, 5]
+  let value = 1
+  find(each: value, in: list)
+}
+",
+        find_position_of("find").to_selection()
+    );
+}
+
+#[test]
 fn pattern_match_on_argument_generates_unique_names_even_with_labels() {
     assert_code_action!(
         PATTERN_MATCH_ON_ARGUMENT,
@@ -6419,7 +7817,7 @@ pub type Person {
 ";
 
     assert_code_action!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         TestProject::for_source(src).add_package_module(
             "gleam_json",
             "gleam/json",
@@ -6463,7 +7861,7 @@ pub type Wibble(value) {
 ";
 
     assert_code_action!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         TestProject::for_source(src)
             .add_module("gleam/option", "pub type Option(a)")
             .add_module("gleam/dict", "pub type Dict(k, v)")
@@ -6498,7 +7896,7 @@ pub type Wibble {
 ";
 
     assert_code_action!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         TestProject::for_source(src).add_package_module(
             "gleam_json",
             "gleam/json",
@@ -6530,7 +7928,7 @@ pub type Wibble {
 ";
 
     assert_code_action!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         TestProject::for_source(src).add_package_module(
             "gleam_json",
             "gleam/json",
@@ -6549,7 +7947,7 @@ pub type Wibble {
 ";
 
     assert_code_action!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         TestProject::for_source(src).add_package_module(
             "gleam_json",
             "gleam/json",
@@ -6570,7 +7968,7 @@ pub type Wibble {
 ";
 
     assert_code_action!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         TestProject::for_source(src).add_package_module(
             "gleam_json",
             "gleam/json",
@@ -6590,7 +7988,7 @@ pub type Wibble {
 ";
 
     assert_code_action!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         TestProject::for_source(src).add_package_module(
             "gleam_json",
             "gleam/json",
@@ -6627,7 +8025,7 @@ pub type LinkedList {
 }
 ";
     assert_code_action!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         TestProject::for_source(src)
             .add_module("gleam/option", "pub type Option(a) { Some(a) None }")
             .add_package_module("gleam_json", "gleam/json", "pub type Json"),
@@ -6660,7 +8058,7 @@ pub type Wibble {
 ";
 
     assert_code_action!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         TestProject::for_source(src).add_package_module(
             "gleam_json",
             "gleam/json",
@@ -6680,7 +8078,7 @@ pub type Wibble {
 ";
 
     assert_code_action!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         TestProject::for_source(src).add_package_module(
             "gleam_json",
             "gleam/json",
@@ -6701,7 +8099,7 @@ pub type Wibble {
 ";
 
     assert_code_action!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         TestProject::for_source(src).add_package_module(
             "gleam_json",
             "gleam/json",
@@ -6825,7 +8223,7 @@ pub type Wibble {
     ";
 
     assert_no_code_actions!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         TestProject::for_source(src).add_package_module(
             "gleam_json",
             "gleam/json",
@@ -6838,7 +8236,7 @@ pub type Wibble {
 #[test]
 fn no_code_action_to_generate_json_encoder_without_gleam_json_dependency() {
     assert_no_code_actions!(
-        GENERATE_JSON_ENCODER,
+        GENERATE_TO_JSON_FUNCTION,
         "
 pub type Wibble {
   Wibble(w: Int)
@@ -6920,6 +8318,20 @@ pub fn main(x) {
         INLINE_VARIABLE,
         TestProject::for_source(src).add_module("gleam/io", "pub fn println(value) {}"),
         find_position_of("message =").to_selection()
+    );
+}
+
+#[test]
+fn inline_variable_when_over_let_keyword() {
+    assert_code_action!(
+        INLINE_VARIABLE,
+        r#"
+pub fn main() {
+  let x = 123
+  x + 1
+}
+"#,
+        find_position_of("let").to_selection()
     );
 }
 
@@ -7019,6 +8431,32 @@ pub fn main() {
 }
 ",
         find_position_of("wibble").to_selection()
+    );
+}
+
+#[test]
+fn convert_to_pipe_works_in_anonymous_function_inside_a_pipeline() {
+    assert_code_action!(
+        CONVERT_TO_PIPE,
+        "
+pub fn main() {
+  wibble |> wobble(fn() { woo(1) })
+}
+",
+        find_position_of("woo").to_selection()
+    );
+}
+
+#[test]
+fn convert_to_pipe_works_in_final_step_of_a_pipeline() {
+    assert_code_action!(
+        CONVERT_TO_PIPE,
+        "
+pub fn main() {
+  wibble |> wobble(woo(1))
+}
+",
+        find_position_of("woo").to_selection()
     );
 }
 
@@ -7637,5 +9075,1804 @@ pub fn main() -> wibble.Wibble {
         "Unqualify wibble.Wibble",
         TestProject::for_source(src).add_hex_module("wibble", "pub type Wibble"),
         find_position_of("wibble.Wibble").to_selection(),
+    );
+}
+
+#[test]
+fn fill_labels_pattern_constructor() {
+    assert_code_action!(
+        FILL_LABELS,
+        "
+pub type Wibble {
+  Wibble(a: Int, b: Float, c: String)
+  Wobble(d: Bool, e: BitArray, f: List(Result(String, Nil)))
+}
+
+pub fn main(w: Wibble) {
+  case w {
+    Wibble(..) -> todo
+    Wobble() -> todo
+  }
+}
+",
+        find_position_of("Wobble()").to_selection(),
+    );
+}
+
+#[test]
+fn fill_labels_pattern_constructor_let_assignment() {
+    assert_code_action!(
+        FILL_LABELS,
+        "
+pub type Wibble {
+  Wibble(a: Int, b: Float, c: String)
+}
+
+pub fn main() {
+  let Wibble() = todo
+}
+",
+        find_position_of("Wibble()").to_selection(),
+    );
+}
+
+#[test]
+fn fill_labels_pattern_constructor_with_some_labels() {
+    assert_code_action!(
+        FILL_LABELS,
+        "
+pub type Wibble {
+  Wibble(a: Int, b: Float, c: String)
+  Wobble(d: Bool, e: BitArray, f: List(Result(String, Nil)))
+}
+
+pub fn main(w: Wibble) {
+  case w {
+    Wobble(e: <<>>) -> todo
+    _ -> todo
+  }
+}
+",
+        find_position_of("Wobble(e").to_selection(),
+    );
+}
+
+#[test]
+fn fill_labels_nested_pattern_constructor() {
+    assert_code_action!(
+        FILL_LABELS,
+        "
+pub type Wibble {
+  Wibble(a: Int, b: Float, c: String)
+  Wobble(d: Bool, e: BitArray, f: List(Result(String, Nil)))
+}
+
+pub fn main() {
+  case todo {
+    #([Wobble()], 2, 3) -> todo
+    _ -> todo
+  }
+}
+",
+        find_position_of("Wobble()").to_selection(),
+    );
+}
+
+#[test]
+// https://github.com/gleam-lang/gleam/issues/4499
+fn fill_labels_with_function_with_unlabelled_arguments() {
+    assert_no_code_actions!(
+        FILL_LABELS,
+        "
+pub fn main() {
+    fold(0, over: [], with: fn(acc, item) { acc + item })
+}
+
+pub fn fold(over list, from initial, with fun) { todo }",
+        find_position_of("fold").to_selection(),
+    );
+}
+
+#[test]
+fn add_missing_patterns_with_labels() {
+    assert_code_action!(
+        ADD_MISSING_PATTERNS,
+        "
+pub type Wibble {
+  Wibble(integer: Int, float: Float)
+  Wobble(string: String, bool: Bool)
+}
+
+pub fn main(w: Wibble) {
+  case w {}
+}
+",
+        find_position_of("case w").select_until(find_position_of("{}")),
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/3628#issuecomment-2543342212
+#[test]
+fn add_missing_patterns_multibyte_grapheme() {
+    assert_code_action!(
+        ADD_MISSING_PATTERNS,
+        r#"
+// ä
+fn wibble() {
+  case True {}
+}
+"#,
+        find_position_of("case").select_until(find_position_of("True {"))
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4626
+#[test]
+fn add_missing_patterns_opaque_type() {
+    let src = "
+import mod
+
+pub fn main(w: mod.Wibble) {
+  case w {}
+}
+";
+
+    assert_code_action!(
+        ADD_MISSING_PATTERNS,
+        TestProject::for_source(src).add_hex_module(
+            "mod",
+            "pub opaque type Wibble { Wibble(Int) Wobble(String) }"
+        ),
+        find_position_of("{}").to_selection(),
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4653
+#[test]
+fn generate_function_capture() {
+    assert_code_action!(
+        GENERATE_FUNCTION,
+        "
+fn map(list: List(a), f: fn(a) -> b) -> List(b) {
+  todo
+}
+
+pub fn main() {
+  map([1, 2, 3], add(_, 1))
+}
+",
+        find_position_of("add").to_selection()
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4660#issuecomment-2932371619
+#[test]
+fn inline_variable_label_shorthand() {
+    assert_code_action!(
+        INLINE_VARIABLE,
+        "
+pub type Example {
+  Example(sum: Int, nil: Nil)
+}
+
+pub fn main() {
+  let sum = 1 + 1
+
+  Example(Nil, sum:)
+}
+",
+        find_position_of("sum = ").to_selection()
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4660
+#[test]
+fn no_inline_variable_action_for_parameter() {
+    assert_no_code_actions!(
+        INLINE_VARIABLE,
+        "
+pub fn main() {
+  let x = fn(something) {
+    something
+  }
+
+  x
+}
+",
+        find_position_of("something")
+            .nth_occurrence(2)
+            .to_selection()
+    );
+}
+
+#[test]
+fn no_inline_variable_action_when_spanning_multiple_items() {
+    assert_no_code_actions!(
+        INLINE_VARIABLE,
+        "
+pub fn main(x: Int, y: Int) {
+  let a = 1
+  let b = 2
+  main(a, b)
+}
+",
+        find_position_of("main")
+            .nth_occurrence(2)
+            .select_until(find_position_of(")").nth_occurrence(2))
+    );
+}
+
+#[test]
+fn no_inline_variable_action_for_use_pattern() {
+    assert_no_code_actions!(
+        INLINE_VARIABLE,
+        "
+pub fn main() {
+  let x = {
+    use something <- todo
+    something
+  }
+
+  x
+}
+",
+        find_position_of("something").to_selection()
+    );
+}
+
+#[test]
+fn no_inline_variable_action_for_case_pattern() {
+    assert_no_code_actions!(
+        INLINE_VARIABLE,
+        "
+pub fn main() {
+  let x = case todo {
+    something -> something
+  }
+
+  x
+}
+",
+        find_position_of("something")
+            .nth_occurrence(2)
+            .to_selection()
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4675
+#[test]
+fn extract_variable_use() {
+    assert_no_code_actions!(
+        EXTRACT_VARIABLE,
+        "
+pub fn main() {
+  #({
+    use <- todo
+    todo
+  })
+}
+  ",
+        find_position_of("use").to_selection()
+    );
+}
+
+#[test]
+fn extract_variable_in_anonymous_fn_in_argument() {
+    assert_code_action!(
+        EXTRACT_VARIABLE,
+        "fn map(value, fn_over_value) { todo }
+
+pub fn main() {
+  1
+  |> Ok
+  |> map(fn(value) { value + 2 })
+}",
+        find_position_of("2").to_selection()
+    );
+}
+
+#[test]
+fn do_not_extract_top_level_variable_in_anonymous_fn_in_argument() {
+    assert_no_code_actions!(
+        EXTRACT_VARIABLE,
+        "fn map(value, fn_over_value) { todo }
+
+pub fn main() {
+  1
+  |> Ok
+  |> map(fn(value) { value + 1 })
+}",
+        find_position_of("value").nth_occurrence(4).to_selection()
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4739
+#[test]
+fn do_not_import_internal_modules() {
+    const IMPORT_MODULE: &str = "Import `package/internal`";
+    let code = "
+pub fn main() {
+  internal.some_internal_function()
+}
+";
+
+    assert_no_code_actions!(
+        IMPORT_MODULE,
+        TestProject::for_source(code).add_package_module(
+            "package",
+            "package/internal",
+            "pub fn some_internal_function() { todo }"
+        ),
+        find_position_of("internal").to_selection()
+    );
+}
+
+#[test]
+fn import_internal_module_from_same_package() {
+    let code = "
+pub fn main() {
+  internal.some_internal_function()
+}
+";
+
+    assert_code_action!(
+        "Import `app/internal`",
+        TestProject::for_source(code).add_package_module(
+            "app",
+            "app/internal",
+            "pub fn some_internal_function() { todo }"
+        ),
+        find_position_of("internal").to_selection()
+    );
+}
+
+#[test]
+fn remove_block_1() {
+    assert_code_action!(
+        REMOVE_BLOCK,
+        "pub fn main() {
+    { 1 }
+}
+",
+        find_position_of("1").to_selection()
+    );
+}
+
+#[test]
+fn remove_block_2() {
+    assert_code_action!(
+        REMOVE_BLOCK,
+        "pub fn main() {
+    { main() <> 2 }
+}
+",
+        find_position_of("}").to_selection()
+    );
+}
+
+#[test]
+fn remove_block_3() {
+    assert_code_action!(
+        REMOVE_BLOCK,
+        "pub fn main() {
+    case 1 {
+      _ -> { main() <> 2 }
+    }
+}
+",
+        find_position_of("{").nth_occurrence(3).to_selection()
+    );
+}
+
+#[test]
+fn remove_block_triggers_on_the_innermost_selected_block() {
+    assert_code_action!(
+        REMOVE_BLOCK,
+        "pub fn main(x) {
+    {
+      main({
+        1
+      })
+    }
+}
+",
+        find_position_of("1").to_selection()
+    );
+}
+
+#[test]
+fn remove_block_does_not_unwrap_a_let_assignment() {
+    assert_no_code_actions!(
+        REMOVE_BLOCK,
+        "pub fn main(x) {
+    {
+      let a = 1
+    }
+}
+",
+        find_position_of("let").to_selection()
+    );
+}
+
+#[test]
+fn remove_block_unwraps_a_single_expression_in_a_binop() {
+    assert_code_action!(
+        REMOVE_BLOCK,
+        "pub fn main(x) {
+    { main(1) } * 3
+}
+",
+        find_position_of("main").nth_occurrence(2).to_selection()
+    );
+}
+
+#[test]
+fn remove_block_does_not_unwrap_a_binop() {
+    assert_no_code_actions!(
+        REMOVE_BLOCK,
+        "pub fn main(x) {
+    { 1 * 2 } + 3
+}
+",
+        find_position_of("1").to_selection()
+    );
+}
+
+#[test]
+fn remove_block_does_not_unwrap_a_block_with_multiple_statements() {
+    assert_no_code_actions!(
+        REMOVE_BLOCK,
+        "pub fn main(x) {
+    {
+      main(1)
+      main(2)
+    }
+}
+",
+        find_position_of("1").to_selection()
+    );
+}
+
+#[test]
+fn remove_opaque_from_private_type() {
+    assert_code_action!(
+        REMOVE_OPAQUE_FROM_PRIVATE_TYPE,
+        "opaque type Wibble {
+  Wobble
+}
+",
+        find_position_of("Wibble").to_selection()
+    );
+}
+
+#[test]
+fn allow_further_pattern_matching_on_let_tuple_destructuring() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "pub fn main(x) {
+  let #(one, other) = #(Ok(1), Error(Nil))
+}
+",
+        find_position_of("one").to_selection()
+    );
+}
+
+#[test]
+fn allow_further_pattern_matching_on_let_record_destructuring() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "pub fn main(x) {
+  let Wibble(field:) = Wibble(Ok(Nil))
+}
+
+pub type Wibble { Wibble(field: Result(Nil, String)) }
+",
+        find_position_of("field").to_selection()
+    );
+}
+
+#[test]
+fn allow_further_pattern_matching_on_asserted_result() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "pub fn main(x) {
+  let assert Ok(one) = Ok(Error(Nil))
+}
+",
+        find_position_of("one").to_selection()
+    );
+}
+
+#[test]
+fn allow_further_pattern_matching_on_asserted_list() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "pub fn main(x) {
+  let assert [first, ..] = [Ok(Nil), ..todo]
+  todo
+}
+",
+        find_position_of("first").to_selection()
+    );
+}
+
+#[test]
+fn pattern_match_on_list_variable() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_ARGUMENT,
+        "pub fn main(a_list: List(a)) {
+  todo
+}",
+        find_position_of("a_list").to_selection()
+    );
+}
+
+#[test]
+fn pattern_match_on_list_tail() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "pub fn main(a_list: List(a)) {
+  case a_list {
+    [] -> todo
+    [first, ..rest] -> todo
+  }
+}",
+        find_position_of("rest").to_selection()
+    );
+}
+
+#[test]
+fn pattern_match_on_list_tail_with_strange_whitespace() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "pub fn main(a_list: List(a)) {
+  case a_list {
+    [] -> todo
+    [first, ..        rest] -> todo
+  }
+}",
+        find_position_of("        ").to_selection()
+    );
+}
+
+#[test]
+fn pattern_match_on_list_tail_used_in_a_branch() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "pub fn main(a_list: List(a)) {
+  case a_list {
+    [] -> todo
+    [first, ..rest] -> rest
+  }
+}",
+        find_position_of("rest").to_selection()
+    );
+}
+
+#[test]
+fn pattern_match_on_list_tail_with_shadowed_name() {
+    assert_code_action!(
+        PATTERN_MATCH_ON_VARIABLE,
+        "pub fn main(a_list: List(a)) {
+  case a_list {
+    [] -> todo
+    [rest, ..else_] -> todo
+  }
+}",
+        find_position_of("else_").to_selection()
+    );
+}
+
+#[test]
+fn collapse_nested_case() {
+    assert_code_action!(
+        COLLAPSE_NESTED_CASE,
+        "pub fn main(x) {
+  case x {
+    Ok(var) -> case var {
+      1 -> 2
+      2 -> 4
+      _ -> -1
+    }
+    _ -> todo
+  }
+}",
+        find_position_of("var").to_selection()
+    );
+}
+
+#[test]
+fn collapse_nested_case_works_with_blocks() {
+    assert_code_action!(
+        COLLAPSE_NESTED_CASE,
+        "pub fn main(x) {
+  case x {
+    Ok(var) -> {
+      case var {
+        1 -> 2
+        2 -> 4
+        _ -> -1
+      }
+    }
+    _ -> todo
+  }
+}",
+        find_position_of("var").to_selection()
+    );
+}
+
+#[test]
+fn collapse_nested_case_works_with_patterns_defining_multiple_variables() {
+    assert_code_action!(
+        COLLAPSE_NESTED_CASE,
+        "pub fn main(x) {
+  case x {
+    Wibble(var, var2) ->
+      case var {
+        1 -> 2
+        2 -> 4
+        _ -> -1
+      }
+
+    Wobble -> todo
+  }
+}
+
+pub type Wibble {
+  Wibble(Int, String)
+  Wobble
+}
+",
+        find_position_of("var").to_selection()
+    );
+}
+
+#[test]
+fn collapse_nested_case_does_not_remove_labels() {
+    assert_code_action!(
+        COLLAPSE_NESTED_CASE,
+        "pub fn main(x) {
+  case x {
+    Wibble(field2:, field: wibble) ->
+      case wibble {
+        1 -> 2
+        2 -> 4
+        _ -> -1
+      }
+
+    Wobble -> todo
+  }
+}
+
+pub type Wibble {
+  Wibble(field: Int, field2: String)
+  Wobble
+}
+",
+        find_position_of("field").to_selection()
+    );
+}
+
+#[test]
+fn collapse_nested_case_does_not_remove_labels_with_shorthand_syntax() {
+    assert_code_action!(
+        COLLAPSE_NESTED_CASE,
+        "pub fn main(x) {
+  case x {
+    Wibble(field2:, field:) ->
+      case field {
+        1 -> 2
+        2 -> 4
+        _ -> -1
+      }
+
+    Wobble -> todo
+  }
+}
+
+pub type Wibble {
+  Wibble(field: Int, field2: String)
+  Wobble
+}
+",
+        find_position_of("field").to_selection()
+    );
+}
+
+#[test]
+fn collapse_nested_case_works_with_alternative_patterns() {
+    assert_code_action!(
+        COLLAPSE_NESTED_CASE,
+        "pub fn main(x) {
+  case x {
+    [first, ..rest] ->
+      case first {
+        1 | 2 -> True
+        3 | 4 | 5 -> False
+        _ -> False
+      }
+
+    [] -> True
+  }
+}
+",
+        find_position_of("first").to_selection()
+    );
+}
+
+#[test]
+fn collapse_nested_case_aliases_variable_if_it_is_used() {
+    assert_code_action!(
+        COLLAPSE_NESTED_CASE,
+        "pub fn main(x) {
+  case x {
+    [first, ..rest] ->
+      case first {
+        1 | 2 -> first
+        3 | 4 | 5 -> 5
+        _ -> 0
+      }
+
+    [] -> -1
+  }
+}
+",
+        find_position_of("first").to_selection()
+    );
+}
+
+#[test]
+fn collapse_nested_case_does_not_ignore_outer_guards() {
+    assert_code_action!(
+        COLLAPSE_NESTED_CASE,
+        "pub fn main(x) {
+  case x {
+    [first, ..rest] if True ->
+      case first {
+        1 -> 1.1
+        _ -> 0.0 *. 10.0
+      }
+
+    [] -> 1.1
+  }
+}
+",
+        find_position_of("first").to_selection()
+    );
+}
+
+#[test]
+fn collapse_nested_case_does_not_ignore_inner_guards() {
+    assert_code_action!(
+        COLLAPSE_NESTED_CASE,
+        "pub fn main(x) {
+  case x {
+    [first, ..rest] ->
+      case first {
+        1 -> 1.1
+        _ if True -> 0.0 *. 10.0
+        _ -> 0.0
+      }
+
+    [] -> 1.1
+  }
+}
+",
+        find_position_of("first").to_selection()
+    );
+}
+
+#[test]
+fn collapse_nested_case_combines_inner_and_outer_guards() {
+    assert_code_action!(
+        COLLAPSE_NESTED_CASE,
+        "pub fn main(x) {
+  case x {
+    [first, ..rest] if False ->
+      case first {
+        1 if False -> 1.1
+        _ if True -> 0.0 *. 10.0
+        _ -> 0.0
+      }
+
+    [] -> 1.1
+  }
+}
+",
+        find_position_of("first").to_selection()
+    );
+}
+
+#[test]
+fn collapse_nested_case_combines_inner_and_outer_guards_and_adds_parentheses_when_needed() {
+    assert_code_action!(
+        COLLAPSE_NESTED_CASE,
+        "pub fn main(x) {
+  case x {
+    [first, ..rest] if False || True ->
+      case first {
+        1 if False && True -> 1.1
+        _ if True || False -> 0.0 *. 10.0
+        _ -> 0.0
+      }
+
+    [] -> 1.1
+  }
+}
+",
+        find_position_of("first").to_selection()
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/3786
+#[test]
+fn type_variables_from_other_functions_do_not_change_annotations() {
+    assert_code_action!(
+        ADD_ANNOTATIONS,
+        "
+fn wibble(a: a, b: b, c: c) -> d { todo }
+
+fn pair(a, b) {
+  #(a, b)
+}
+",
+        find_position_of("pair").to_selection()
+    );
+}
+
+#[test]
+fn type_variables_from_other_functions_do_not_change_annotations_constant() {
+    assert_code_action!(
+        ADD_ANNOTATION,
+        "
+fn wibble(a: a, b: b, c: c) -> d { todo }
+
+const empty = []
+",
+        find_position_of("empty").to_selection()
+    );
+}
+
+#[test]
+fn type_variables_are_not_duplicated_when_adding_annotations() {
+    assert_code_action!(
+        ADD_ANNOTATIONS,
+        "
+fn wibble(a: a, b: b, c: c) -> d { todo }
+
+fn many_args(a, b, c, d: d, e: a, f, g) {
+  todo
+}
+",
+        find_position_of("many_args").to_selection()
+    );
+}
+
+#[test]
+fn type_variables_in_let_bindings_are_considered_when_adding_annotations() {
+    assert_code_action!(
+        ADD_ANNOTATIONS,
+        "
+fn wibble(a, b, c) {
+  let x: a = todo
+  fn(a: b, b: c) -> d {
+    todo
+  }
+}
+",
+        find_position_of("wibble").to_selection()
+    );
+}
+
+#[test]
+fn generated_function_annotations_are_not_affected_by_other_functions() {
+    assert_code_action!(
+        GENERATE_FUNCTION,
+        "
+fn wibble(a: a, b: b, c: c) -> d { todo }
+
+pub fn main() {
+  let x = todo
+  let y = todo
+  let #(a, b) = something(x, y)
+  b
+}
+",
+        find_position_of("something").to_selection()
+    );
+}
+
+#[test]
+fn generate_function_in_other_module() {
+    let src = "
+import wibble
+
+pub fn main() {
+  wibble.wibble()
+  wibble.wobble()
+}
+";
+
+    assert_code_action!(
+        GENERATE_FUNCTION,
+        TestProject::for_source(src).add_module("wibble", "pub fn wibble() {}"),
+        find_position_of("wobble").to_selection()
+    );
+}
+
+#[test]
+fn generating_function_in_other_module_uses_local_names() {
+    let src = r#"
+import wibble
+
+pub fn main() -> List(Nil) {
+  wibble.wibble(1, #(True, "Hello"))
+}
+"#;
+
+    assert_code_action!(
+        GENERATE_FUNCTION,
+        TestProject::for_source(src).add_module(
+            "wibble",
+            "import gleam.{type Int as Number, type Bool as Boolean, type String as Text, type Nil as Nothing}"
+        ),
+        find_position_of("wibble(").to_selection()
+    );
+}
+
+#[test]
+fn generating_function_in_other_module_uses_labels() {
+    let src = r#"
+import wibble
+
+pub fn main() {
+  wibble.wibble("Unlabelled", int: 1, bool: True)
+}
+"#;
+
+    assert_code_action!(
+        GENERATE_FUNCTION,
+        TestProject::for_source(src).add_module("wibble", ""),
+        find_position_of("wibble(").to_selection()
+    );
+}
+
+#[test]
+fn no_code_action_to_generate_existing_function_in_other_module() {
+    let src = r#"
+import wibble
+
+pub fn main() {
+  wibble.wibble(1, 2, 3)
+}
+"#;
+
+    assert_no_code_actions!(
+        GENERATE_FUNCTION,
+        TestProject::for_source(src).add_module("wibble", "pub fn wibble(a, b, c) { a + b + c }"),
+        find_position_of("wibble(").to_selection()
+    );
+}
+
+#[test]
+fn do_not_generate_function_in_other_package() {
+    let src = r#"
+import maths
+
+pub fn main() {
+  maths.add(1, 2)
+  maths.subtract(1, 2)
+}
+"#;
+
+    assert_no_code_actions!(
+        GENERATE_FUNCTION,
+        TestProject::for_source(src).add_dep_module("maths", "pub fn add(a, b) { a + b }"),
+        find_position_of("subtract").to_selection()
+    );
+}
+
+#[test]
+fn remove_unreachable_clauses() {
+    assert_code_action!(
+        REMOVE_UNREACHABLE_CLAUSES,
+        "pub fn main(x) {
+  case x {
+    Ok(n) -> 1
+    Ok(_) -> 2
+    Error(_) -> todo
+    Ok(1) -> 3
+  }
+}
+",
+        find_position_of("Ok(1)").to_selection()
+    );
+}
+
+#[test]
+fn remove_unreachable_branches_does_not_pop_up_if_all_branches_are_reachable() {
+    assert_no_code_actions!(
+        REMOVE_UNREACHABLE_CLAUSES,
+        "pub fn main(x) {
+  case x {
+    Ok(n) -> 1
+    Error(_) -> todo
+  }
+
+  case x {
+    Ok(n) -> todo
+    Ok(_) -> todo
+    _ -> todo
+  }
+}
+",
+        find_position_of("Ok(n)").to_selection()
+    );
+}
+
+#[test]
+fn add_type_annotations_public_alias_to_internal_type_aliased_module() {
+    let src = "
+import package as pkg
+
+pub fn main() {
+  pkg.make_wibble()
+}
+";
+
+    assert_code_action!(
+        ADD_ANNOTATION,
+        TestProject::for_source(src)
+            .add_package_module(
+                "package",
+                "package",
+                "
+import package/internal
+
+pub type Wibble = internal.Wibble
+
+pub fn make_wibble() {
+  internal.Wibble
+}
+"
+            )
+            .add_package_module("package", "package/internal", "pub type Wibble { Wibble }"),
+        find_position_of("main").to_selection(),
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/3898
+#[test]
+fn add_type_annotations_public_alias_to_internal_type() {
+    let src = "
+import package
+
+pub fn main() {
+  package.make_wibble()
+}
+";
+
+    assert_code_action!(
+        ADD_ANNOTATION,
+        TestProject::for_source(src)
+            .add_package_module(
+                "package",
+                "package",
+                "
+import package/internal
+
+pub type Wibble = internal.Wibble
+
+pub fn make_wibble() {
+  internal.Wibble
+}
+"
+            )
+            .add_package_module("package", "package/internal", "pub type Wibble { Wibble }"),
+        find_position_of("main").to_selection(),
+    );
+}
+
+#[test]
+fn add_type_annotations_public_alias_to_internal_generic_type() {
+    let src = "
+import package
+
+pub fn main() {
+  package.make_wibble(10)
+}
+";
+
+    assert_code_action!(
+        ADD_ANNOTATION,
+        TestProject::for_source(src)
+            .add_package_module(
+                "package",
+                "package",
+                "
+import package/internal
+
+pub type Wibble(a, b) = internal.Wibble(a, b)
+
+pub fn make_wibble(x) {
+  internal.Wibble(x)
+}
+"
+            )
+            .add_package_module(
+                "package",
+                "package/internal",
+                "pub type Wibble(a, b) { Wibble(a) }"
+            ),
+        find_position_of("main").to_selection(),
+    );
+}
+
+#[test]
+fn add_type_annotations_uses_internal_name_for_same_package() {
+    let src = "
+import thepackage/internal
+
+pub fn main() {
+  internal.Constructor
+}
+";
+
+    assert_code_action!(
+        ADD_ANNOTATION,
+        TestProject::for_source(src)
+            .add_module(
+                "thepackage/internal",
+                "
+pub type Internal { Constructor }
+"
+            )
+            .add_module(
+                "thepackage/external",
+                "
+import thepackage/internal
+
+pub type External = internal.Internal
+"
+            ),
+        find_position_of("main").to_selection(),
+    );
+}
+
+#[test]
+fn add_omitted_labels_in_function_call() {
+    assert_code_action!(
+        ADD_OMITTED_LABELS,
+        "
+pub fn main() {
+  labelled(1, 2)
+}
+
+pub fn labelled(a a, b b) { todo }
+    ",
+        find_position_of("labelled").to_selection(),
+    );
+}
+
+#[test]
+fn add_omitted_labels_in_function_call_with_some_labels() {
+    assert_code_action!(
+        ADD_OMITTED_LABELS,
+        "
+pub fn main() {
+  labelled(1, 2)
+}
+
+pub fn labelled(a, b b) { todo }
+    ",
+        find_position_of("labelled").to_selection(),
+    );
+}
+
+#[test]
+fn add_omitted_labels_in_function_call_uses_shorthand_syntax() {
+    assert_code_action!(
+        ADD_OMITTED_LABELS,
+        "
+pub fn main() {
+  let a = 1
+  labelled(a, 2)
+}
+
+pub fn labelled(a a, b b) { todo }
+    ",
+        find_position_of("labelled").to_selection(),
+    );
+}
+
+#[test]
+fn add_omitted_labels_works_with_innermost_function_call() {
+    assert_code_action!(
+        ADD_OMITTED_LABELS,
+        "
+pub fn main() {
+  let a = 1
+  labelled(a, labelled(1, 2))
+}
+
+pub fn labelled(a a, b b) { todo }
+    ",
+        find_position_of("labelled")
+            .nth_occurrence(2)
+            .to_selection(),
+    );
+}
+
+#[test]
+fn add_omitted_labels_works_with_constructors_calls() {
+    assert_code_action!(
+        ADD_OMITTED_LABELS,
+        "
+pub fn main() {
+  Labelled(1, 2)
+}
+
+pub type Labelled {
+  Labelled(Int, b: Int)
+}
+    ",
+        find_position_of("Labelled").to_selection(),
+    );
+}
+
+#[test]
+fn add_omitted_labels_works_with_constructors_calls_with_some_labels_1() {
+    assert_code_action!(
+        ADD_OMITTED_LABELS,
+        "
+pub fn main() {
+  labelled(3, 1, b: 2)
+}
+
+pub fn labelled(a a, b b, c c) { todo }
+    ",
+        find_position_of("labelled").to_selection(),
+    );
+}
+
+#[test]
+fn add_omitted_labels_works_with_constructors_calls_with_some_labels() {
+    assert_code_action!(
+        ADD_OMITTED_LABELS,
+        "
+pub fn main() {
+  let a = 1
+  labelled(a, b: 2)
+}
+
+pub fn labelled(a a, b b) { todo }
+    ",
+        find_position_of("labelled").to_selection(),
+    );
+}
+
+#[test]
+fn add_omitted_labels_works_on_call_with_wrongly_placed_labels() {
+    assert_code_action!(
+        ADD_OMITTED_LABELS,
+        "
+pub fn main() {
+  labelled(3, b: 2, 1)
+}
+
+pub fn labelled(a a, b b, c c) { todo }
+    ",
+        find_position_of("labelled").to_selection(),
+    );
+}
+
+#[test]
+fn add_omitted_labels_does_not_work_on_call_with_wrong_labels_2() {
+    assert_no_code_actions!(
+        ADD_OMITTED_LABELS,
+        "
+pub fn main() {
+  labelled(3, 1, d: 2)
+}
+
+pub fn labelled(a a, b b, c c) { todo }
+    ",
+        find_position_of("labelled").to_selection(),
+    );
+}
+
+#[test]
+fn add_omitted_labels_does_not_pop_up_if_called_function_has_no_labels() {
+    assert_no_code_actions!(
+        ADD_OMITTED_LABELS,
+        "
+pub fn main() {
+  let a = 1
+  labelled(a, 2)
+}
+
+pub fn labelled(a, b) { todo }
+    ",
+        find_position_of("labelled").to_selection(),
+    );
+}
+
+#[test]
+fn add_omitted_labels_does_not_label_piped_argument() {
+    assert_code_action!(
+        ADD_OMITTED_LABELS,
+        "
+pub fn main() {
+  1 |> labelled(2)
+}
+
+pub fn labelled(a a, b b) { todo }
+    ",
+        find_position_of("labelled").to_selection(),
+    );
+}
+
+#[test]
+fn add_omitted_labels_does_not_label_use() {
+    assert_code_action!(
+        ADD_OMITTED_LABELS,
+        "
+pub fn main() {
+  use <- labelled(1)
+  todo
+}
+
+pub fn labelled(a a, b b) { todo }
+    ",
+        find_position_of("labelled").to_selection(),
+    );
+}
+
+#[test]
+fn extract_function() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        "
+pub fn do_things(a, b) {
+  let result = {
+    let a = 10 + a
+    let b = 10 + b
+    a * b
+  }
+  result + 3
+}
+",
+        find_position_of("{")
+            .nth_occurrence(2)
+            .select_until(find_position_of("}"))
+    );
+}
+
+#[test]
+fn extract_function_from_statements() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        "
+pub fn do_things(a, b) {
+  let a = 10 + a
+  let b = 10 + b
+  let result = a * b
+  result + 3
+}
+",
+        find_position_of("let").select_until(find_position_of("* b"))
+    );
+}
+
+#[test]
+fn extract_function_which_use_variables_defined_in_the_extracted_span() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        "
+pub fn do_things(a, b) {
+  let new_a = 10 + a
+  let new_b = 10 + b
+  let result = new_a * new_b
+  result + 3
+}
+",
+        find_position_of("let").select_until(find_position_of("* new_b"))
+    );
+}
+
+#[test]
+fn extract_function_which_use_variables_shadowed_in_an_inner_scope() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        "
+pub fn do_things(a, b) {
+  let first_part = {
+    let a = a + 10
+    let b = b + 10
+    a * b
+  }
+  let result = first_part + a * b
+  result + 3
+}
+",
+        find_position_of("let").select_until(find_position_of("+ a * b"))
+    );
+}
+
+#[test]
+fn extract_function_which_uses_multiple_extracted_variables() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        "
+pub fn do_things(a, b) {
+  let wibble = a + b
+  let wobble = a * b
+  wobble / wibble
+}
+",
+        find_position_of("let").select_until(find_position_of("* b"))
+    );
+}
+
+#[test]
+fn extract_function_which_uses_no_extracted_variables() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        "
+pub fn do_things(a, b) {
+  let x = a + b
+  echo x
+  a
+}
+",
+        find_position_of("let").select_until(find_position_of("echo x"))
+    );
+}
+
+#[test]
+fn extract_function_which_uses_variable_in_guard() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        "
+pub fn do_things(a, b) {
+  let result = case Nil {
+    _ if a > b -> 17
+    _ if a < b -> 12
+    _ -> panic
+  }
+
+  result % 4
+}
+",
+        find_position_of("case").select_until(find_position_of("}"))
+    );
+}
+
+#[test]
+fn extract_function_which_uses_variable_in_bit_array_pattern() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        "
+pub fn main() {
+  let bits = todo
+  let size = todo
+
+  let segment = case bits {
+    <<x:size(size), _:bits>> -> Ok(x)
+    _ -> Error(Nil)
+  }
+
+  case segment {
+    Ok(value) -> echo value
+    Error(_) -> panic
+  }
+}
+",
+        find_position_of("case").select_until(find_position_of("}"))
+    );
+}
+
+#[test]
+fn extract_function_which_uses_constant() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        "
+const pi = 3.14
+
+pub fn main() {
+  let radius = 4.5
+
+  let circumference = radius *. pi *. 2.0
+
+  echo circumference
+}
+",
+        find_position_of("radius *.").select_until(find_position_of("2.0"))
+    );
+}
+
+#[test]
+fn extract_function_which_uses_constant_in_guard() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        r#"
+const pi = 3.14
+
+pub fn main() {
+  let value = 3.15
+
+  let string = case value {
+    0.0 -> "Zero"
+    1.0 -> "One"
+    _ if value == pi -> "PI"
+    _ -> "Something else"
+  }
+
+  echo string
+}
+"#,
+        find_position_of("case").select_until(find_position_of("}"))
+    );
+}
+
+#[test]
+fn no_code_action_to_extract_function_when_expression_is_not_fully_selected() {
+    assert_no_code_actions!(
+        EXTRACT_FUNCTION,
+        r#"
+fn print(text: String) { todo }
+
+pub fn main() {
+  let arguments = todo
+
+  case arguments {
+    ["help"] -> print("USAGE TEXT HERE")
+    _ -> panic as "Invalid args"
+  }
+}
+"#,
+        find_position_of("print")
+            .under_char('i')
+            .select_until(find_position_of("TEXT"))
+    );
+}
+
+#[test]
+fn extract_function_when_name_already_in_scope() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        r#"
+fn function() { todo }
+
+pub fn do_things(a, b) {
+  let result = {
+    let a = 10 + a
+    let b = 10 + b
+    a * b
+  }
+  result + 3
+}
+"#,
+        find_position_of("= {").select_until(find_position_of("}").nth_occurrence(2))
+    );
+}
+
+#[test]
+fn extract_function_when_multiple_names_already_in_scope() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        r#"
+fn function() { todo }
+fn function_2() { todo }
+fn function_3() { todo }
+fn function_4() { todo }
+
+pub fn do_things(a, b) {
+  let result = {
+    let a = 10 + a
+    let b = 10 + b
+    a * b
+  }
+  result + 3
+}
+"#,
+        find_position_of("= {").select_until(find_position_of("}").nth_occurrence(5))
+    );
+}
+
+#[test]
+fn extract_function_partially_selected() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        r#"
+pub fn main() {
+  let a = 10
+  let b = 20
+  let c = a + b
+
+  echo c
+}
+"#,
+        find_position_of("a =").select_until(find_position_of("c ="))
+    );
+}
+
+#[test]
+fn selected_statements_do_not_select_outer_block() {
+    // We want to make sure only the statements within the block are extracted,
+    // and not the block itself.
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        r#"
+pub fn main() {
+  let c = {
+    let a = 10
+    let b = 20
+    a + b
+  }
+
+  echo c
+}
+"#,
+        find_position_of("let a").select_until(find_position_of("+ b"))
+    );
+}
+
+#[test]
+fn no_code_action_to_extract_when_multiple_functions_are_selected() {
+    assert_no_code_actions!(
+        EXTRACT_FUNCTION,
+        r#"
+pub fn main() {
+  let a = 10
+  a + 1
+}
+
+pub fn other() {
+  let b = 20
+  b * 2
+}
+"#,
+        find_position_of("let a").select_until(find_position_of("let b"))
+    );
+}
+
+#[test]
+fn extract_statements_in_tail_position() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        r#"
+pub fn main() {
+  let a = 1
+  let b = 2
+  let c = 3
+  let d = 4
+  a * b + c * d
+}
+"#,
+        find_position_of("let c").select_until(find_position_of("* d"))
+    );
+}
+
+#[test]
+fn extract_use_in_tail_position() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        r#"
+pub fn main() {
+  use <- wibble
+  123
+}
+
+fn wibble(f: fn() -> Int) -> Int { f() }
+"#,
+        find_position_of("use").select_until(find_position_of("wibble"))
+    );
+}
+
+#[test]
+fn extract_use_in_tail_position_2() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        r#"
+pub fn main() {
+  use <- wibble
+  use <- wobble
+  123
+}
+
+fn wibble(f: fn() -> Float) -> Float { f() }
+fn wobble(f: fn() -> Int) -> Float { 1.1 }
+"#,
+        find_position_of("use")
+            .nth_occurrence(2)
+            .select_until(find_position_of("wobble"))
+    );
+}
+
+#[test]
+fn extract_block_tail_position_3() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        r#"
+pub fn main() {
+  case 1 {
+    _ -> {
+      use <- wibble
+      123
+    }
+    _ -> todo
+  }
+}
+
+fn wibble(f: fn() -> Float) -> Float { f() }
+"#,
+        find_position_of("{")
+            .nth_occurrence(3)
+            .select_until(find_position_of("}"))
+    );
+}
+
+#[test]
+fn extract_block_tail_position_4() {
+    assert_code_action!(
+        EXTRACT_FUNCTION,
+        r#"
+pub fn main() {
+  case 1 {
+    _ -> {
+      use <- wibble
+      use <- wibble
+      123
+    }
+    _ -> todo
+  }
+}
+
+fn wibble(f: fn() -> Float) -> Float { f() }
+"#,
+        find_position_of("{")
+            .nth_occurrence(3)
+            .select_until(find_position_of("}"))
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/5036
+#[test]
+fn generate_function_in_other_module_correctly_appends() {
+    let src = "import module_breaker/another
+
+pub fn main() -> Nil {
+  another.function()
+}
+";
+
+    assert_code_action!(
+        GENERATE_FUNCTION,
+        TestProject::for_source(src).add_module(
+            "module_breaker/another",
+            "pub fn useless() {
+  Nil
+}
+"
+        ),
+        find_position_of("function").to_selection()
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4904
+#[test]
+fn no_code_action_to_generate_function_on_unsupported_target() {
+    assert_no_code_actions!(
+        GENERATE_FUNCTION,
+        r#"
+pub fn main() {
+  wibble()
+}
+
+@external(javascript, "./ffi.mjs", "wibble")
+fn wibble() -> Nil
+"#,
+        find_position_of("wibble").to_selection()
     );
 }

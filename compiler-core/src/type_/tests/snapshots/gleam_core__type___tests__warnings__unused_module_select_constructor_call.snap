@@ -17,8 +17,10 @@ pub fn main() {
 
 
 ----- WARNING
-warning: Unused value
+warning: Unused literal
   ┌─ /src/warning/wrn.gleam:5:3
   │
 5 │   wibble.Wibble(1)
   │   ^^^^^^^^^^^^^^^^ This value is never used
+
+Hint: You can safely remove it.

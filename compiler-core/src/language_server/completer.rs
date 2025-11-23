@@ -14,10 +14,9 @@ use crate::{
     Result,
     ast::{
         self, Arg, CallArg, Definition, Function, FunctionLiteralKind, Pattern, Publicity,
-        TypedExpr,
+        TypedExpr, visit::Visit,
     },
-    build::Module,
-    io::{BeamCompiler, CommandExecutor, FileSystemReader, FileSystemWriter},
+    build::{Module, Origin},
     line_numbers::LineNumbers,
     type_::{
         self, FieldMap, ModuleInterface, PRELUDE_MODULE_NAME, PreludeType, RecordAccessor, Type,
@@ -27,7 +26,6 @@ use crate::{
 };
 
 use super::{
-    DownloadDependencies, MakeLocker,
     compiler::LspProjectCompiler,
     edits::{
         Newlines, add_newlines_after_import, get_import, get_import_edit,
@@ -95,17 +93,7 @@ pub struct Completer<'a, IO> {
     pub module_line_numbers: LineNumbers,
 }
 
-impl<'a, IO> Completer<'a, IO>
-where
-    // IO to be supplied from outside of gleam-core
-    IO: FileSystemReader
-        + FileSystemWriter
-        + BeamCompiler
-        + CommandExecutor
-        + DownloadDependencies
-        + MakeLocker
-        + Clone,
-{
+impl<'a, IO> Completer<'a, IO> {
     pub fn new(
         src: &'a EcoString,
         params: &'a TextDocumentPositionParams,
@@ -130,9 +118,7 @@ where
         &'a self,
         valid_phrase_char: &impl Fn(char) -> bool,
     ) -> (Range, String) {
-        let cursor = self
-            .src_line_numbers
-            .byte_index(self.cursor_position.line, self.cursor_position.character);
+        let cursor = self.src_line_numbers.byte_index(*self.cursor_position);
 
         // Get part of phrase prior to cursor
         let before = self
@@ -193,12 +179,14 @@ where
     /// If the line includes a dot then it provides unqualified import completions.
     /// Otherwise it provides direct module import completions.
     pub fn import_completions(&'a self) -> Option<Result<Option<Vec<CompletionItem>>>> {
-        let start_of_line = self
-            .src_line_numbers
-            .byte_index(self.cursor_position.line, 0);
-        let end_of_line = self
-            .src_line_numbers
-            .byte_index(self.cursor_position.line + 1, 0);
+        let start_of_line = self.src_line_numbers.byte_index(Position {
+            line: self.cursor_position.line,
+            character: 0,
+        });
+        let end_of_line = self.src_line_numbers.byte_index(Position {
+            line: self.cursor_position.line + 1,
+            character: 0,
+        });
 
         // Drop all lines except the line the cursor is on
         let src = self.src.get(start_of_line as usize..end_of_line as usize)?;
@@ -347,16 +335,18 @@ where
             .get_importable_modules()
             .iter()
             //
-            // It is possible to import modules from dependencies of dependencies
-            // but it's not recommended so we don't include them in completions
-            .filter(|(_, module)| {
-                let is_root_or_prelude =
-                    module.package == self.root_package_name() || module.package.is_empty();
-                is_root_or_prelude || direct_dep_packages.contains(&module.package)
-            })
+            // You cannot import yourself
+            .filter(|(name, _)| *name != &self.module.name)
             //
-            // src/ cannot import test/
-            .filter(|(_, module)| module.origin.is_src() || !self.module.origin.is_src())
+            // Different origin directories will get different import completions
+            .filter(|(_, module)| match self.module.origin {
+                // src/ can import from src/
+                Origin::Src => module.origin.is_src(),
+                // dev/ can import from src/ or dev/
+                Origin::Dev => !module.origin.is_test(),
+                // Test can import from anywhere
+                Origin::Test => true,
+            })
             //
             // It is possible to import internal modules from other packages,
             // but it's not recommended so we don't include them in completions
@@ -365,8 +355,13 @@ where
             // You cannot import a module twice
             .filter(|(name, _)| !already_imported.contains(*name))
             //
-            // You cannot import yourself
-            .filter(|(name, _)| *name != &self.module.name)
+            // It is possible to import modules from dependencies of dependencies
+            // but it's not recommended so we don't include them in completions
+            .filter(|(_, module)| {
+                let is_root_or_prelude =
+                    module.package == self.root_package_name() || module.package.is_empty();
+                is_root_or_prelude || direct_dep_packages.contains(&module.package)
+            })
             .collect()
     }
 
@@ -448,10 +443,10 @@ where
                 if let Some(module) = import.used_name() {
                     // If the user has already started a module select then don't show irrelevant modules.
                     // e.x. when the user has typed mymodule.| we should only show items from mymodule.
-                    if let Some(input_mod_name) = &module_select {
-                        if &module != input_mod_name {
-                            continue;
-                        }
+                    if let Some(input_mod_name) = &module_select
+                        && &module != input_mod_name
+                    {
+                        continue;
                     }
                     completions.push(type_completion(
                         Some(&module),
@@ -508,10 +503,10 @@ where
 
             // If the user has already started a module select then don't show irrelevant modules.
             // e.x. when the user has typed mymodule.| we should only show items from mymodule.
-            if let Some(input_mod_name) = &module_select {
-                if qualifier != input_mod_name {
-                    continue;
-                }
+            if let Some(input_mod_name) = &module_select
+                && qualifier != input_mod_name
+            {
+                continue;
             }
 
             // Qualified types
@@ -554,18 +549,26 @@ where
         // e.x. when the user has typed mymodule.| we know local module and prelude values are no longer
         // relevant.
         if module_select.is_none() {
-            let cursor = self
-                .src_line_numbers
-                .byte_index(self.cursor_position.line, self.cursor_position.character);
+            let cursor = self.src_line_numbers.byte_index(*self.cursor_position);
 
             // Find the function that the cursor is in and push completions for
             // its arguments and local variables.
-            if let Some(fun) = self.module.ast.definitions.iter().find_map(|d| match d {
-                Definition::Function(f) if f.full_location().contains(cursor) => Some(f),
-                _ => None,
-            }) {
+            if let Some(function) =
+                self.module
+                    .ast
+                    .definitions
+                    .iter()
+                    .find_map(|definition| match definition {
+                        Definition::Function(function)
+                            if function.full_location().contains(cursor) =>
+                        {
+                            Some(function)
+                        }
+                        _ => None,
+                    })
+            {
                 completions.extend(
-                    LocalCompletion::new(mod_name, insert_range, cursor).fn_completions(fun),
+                    LocalCompletion::new(mod_name, insert_range, cursor).fn_completions(function),
                 );
             }
 
@@ -635,10 +638,10 @@ where
                 if let Some(module) = import.used_name() {
                     // If the user has already started a module select then don't show irrelevant modules.
                     // e.x. when the user has typed mymodule.| we should only show items from mymodule.
-                    if let Some(input_mod_name) = &module_select {
-                        if &module != input_mod_name {
-                            continue;
-                        }
+                    if let Some(input_mod_name) = &module_select
+                        && &module != input_mod_name
+                    {
+                        continue;
                     }
                     completions.push(value_completion(
                         Some(&module),
@@ -694,10 +697,10 @@ where
 
             // If the user has already started a module select then don't show irrelevant modules.
             // e.x. when the user has typed mymodule.| we should only show items from mymodule.
-            if let Some(input_mod_name) = &module_select {
-                if qualifier != input_mod_name {
-                    continue;
-                }
+            if let Some(input_mod_name) = &module_select
+                && qualifier != input_mod_name
+            {
+                continue;
             }
 
             // Qualified values
@@ -788,10 +791,10 @@ where
     pub fn completion_labels(
         &'a self,
         fun: &TypedExpr,
-        existing_args: &[CallArg<TypedExpr>],
+        existing_arguments: &[CallArg<TypedExpr>],
     ) -> Vec<CompletionItem> {
-        let fun_type = fun.type_().fn_types().map(|(args, _)| args);
-        let already_included_labels = existing_args
+        let fun_type = fun.type_().fn_types().map(|(arguments, _)| arguments);
+        let already_included_labels = existing_arguments
             .iter()
             .filter_map(|a| a.label.clone())
             .collect_vec();
@@ -806,9 +809,10 @@ where
             .iter()
             .filter(|field| !already_included_labels.contains(field.0))
             .map(|(label, arg_index)| {
-                let detail = fun_type.as_ref().and_then(|args| {
-                    args.get(*arg_index as usize)
-                        .map(|a| Printer::new().pretty_print(a, 0))
+                let detail = fun_type.as_ref().and_then(|arguments| {
+                    arguments
+                        .get(*arg_index as usize)
+                        .map(|argument| Printer::new().pretty_print(argument, 0))
                 });
                 let label = format!("{label}:");
                 let sort_text = Some(sort_text(CompletionKind::Label, &label));
@@ -1009,27 +1013,21 @@ impl<'a> LocalCompletion<'a> {
         fun: &'a Function<Arc<Type>, TypedExpr>,
     ) -> Vec<CompletionItem> {
         // Add function arguments to completions
-        self.visit_fn_args(&fun.arguments);
+        self.visit_fn_arguments(&fun.arguments);
 
         // Visit the function body statements
         for statement in &fun.body {
-            // We only want to suggest local variables that are defined before
-            // the cursor
-            if statement.location().start >= self.cursor {
-                continue;
-            }
-
             // Visit the statement to find local variables
-            ast::visit::visit_typed_statement(&mut self, statement);
+            self.visit_typed_statement(statement);
         }
 
         self.completions.into_values().collect_vec()
     }
 
-    fn visit_fn_args(&mut self, args: &[Arg<Arc<Type>>]) {
-        for arg in args {
-            if let Some(name) = arg.get_variable_name() {
-                self.push_completion(name, arg.type_.clone());
+    fn visit_fn_arguments(&mut self, arguments: &[Arg<Arc<Type>>]) {
+        for argument in arguments {
+            if let Some(name) = argument.get_variable_name() {
+                self.push_completion(name, argument.type_.clone());
             }
         }
     }
@@ -1046,7 +1044,16 @@ impl<'a> LocalCompletion<'a> {
     }
 }
 
-impl<'ast> ast::visit::Visit<'ast> for LocalCompletion<'_> {
+impl<'ast> Visit<'ast> for LocalCompletion<'_> {
+    fn visit_typed_statement(&mut self, statement: &'ast ast::TypedStatement) {
+        // We only want to suggest local variables that are defined before
+        // the cursor
+        if statement.location().start >= self.cursor {
+            return;
+        }
+        ast::visit::visit_typed_statement(self, statement);
+    }
+
     /// Visits a typed assignment, selectively processing either the value or the pattern
     /// based on the cursor position.
     /// - If the cursor is within the assignment It visits only the value expression.
@@ -1063,17 +1070,44 @@ impl<'ast> ast::visit::Visit<'ast> for LocalCompletion<'_> {
 
     fn visit_typed_expr_fn(
         &mut self,
-        _: &'ast ast::SrcSpan,
+        location: &'ast ast::SrcSpan,
         _: &'ast Arc<Type>,
         _: &'ast FunctionLiteralKind,
-        args: &'ast [ast::TypedArg],
+        arguments: &'ast [ast::TypedArg],
         body: &'ast Vec1<ast::TypedStatement>,
         _: &'ast Option<ast::TypeAst>,
     ) {
-        self.visit_fn_args(args);
+        // If we are completing after the function body, any locally defined
+        // variables are now out of scope so we don't register any.
+        if self.cursor >= location.end {
+            return;
+        }
+        self.visit_fn_arguments(arguments);
         for statement in body {
             self.visit_typed_statement(statement);
         }
+    }
+
+    fn visit_typed_expr_block(
+        &mut self,
+        location: &'ast ast::SrcSpan,
+        statements: &'ast [ast::TypedStatement],
+    ) {
+        // If we are completing after the block, any locally defined variables
+        // are now out of scope so we don't register any.
+        if self.cursor >= location.end {
+            return;
+        }
+        ast::visit::visit_typed_expr_block(self, location, statements);
+    }
+
+    fn visit_typed_clause(&mut self, clause: &'ast ast::TypedClause) {
+        // Any code which comes before or after a case clause cannot access any
+        // of the variables defined within it, so we ignore this clause if so.
+        if self.cursor < clause.location.start || self.cursor > clause.location.end {
+            return;
+        }
+        ast::visit::visit_typed_clause(self, clause);
     }
 
     fn visit_typed_pattern_variable(

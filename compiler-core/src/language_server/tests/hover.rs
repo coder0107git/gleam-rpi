@@ -1589,3 +1589,230 @@ import wibble
         find_position_of("wibble")
     );
 }
+
+#[test]
+fn hover_for_constant_int() {
+    assert_hover!(
+        "
+const ten = 10
+",
+        find_position_of("10")
+    );
+}
+
+#[test]
+fn hover_for_constant_float() {
+    assert_hover!(
+        "
+const pi = 3.14
+",
+        find_position_of("3.14")
+    );
+}
+#[test]
+fn hover_for_constant_string() {
+    assert_hover!(
+        r#"
+const message = "Hello!"
+"#,
+        find_position_of("!")
+    );
+}
+
+#[test]
+fn hover_for_constant_other_constant() {
+    assert_hover!(
+        "
+const constant1 = 10
+const constant2 = constant1
+",
+        find_position_of("= constant1").under_char('s')
+    );
+}
+
+#[test]
+fn hover_for_constant_record() {
+    assert_hover!(
+        "
+type Wibble {
+  Wibble(Int)
+}
+
+const w = Wibble(10)
+",
+        find_position_of("Wibble(10)").under_char('i')
+    );
+}
+
+#[test]
+fn hover_for_constant_tuple() {
+    assert_hover!(
+        "
+const tuple = #(1, 3.5, False)
+",
+        find_position_of("#(")
+    );
+}
+
+#[test]
+fn hover_for_constant_tuple_element() {
+    assert_hover!(
+        "
+const tuple = #(1, 3.5, False)
+",
+        find_position_of("False")
+    );
+}
+
+#[test]
+fn hover_for_constant_list() {
+    assert_hover!(
+        "
+const numbers = [2, 4, 6, 8]
+",
+        find_position_of("[")
+    );
+}
+
+#[test]
+fn hover_for_constant_list_element() {
+    assert_hover!(
+        "
+const numbers = [2, 4, 6, 8]
+",
+        find_position_of("4")
+    );
+}
+
+#[test]
+fn hover_for_constant_string_concatenation() {
+    assert_hover!(
+        r#"
+const name = "Bob"
+const message = "Hello " <> name
+"#,
+        find_position_of("<>")
+    );
+}
+
+#[test]
+fn hover_for_constant_string_concatenation_side() {
+    assert_hover!(
+        r#"
+const name = "Bob"
+const message = "Hello " <> name
+"#,
+        find_position_of("<> name").under_char('n')
+    );
+}
+
+#[test]
+fn hover_for_constant_bit_array() {
+    assert_hover!(
+        "
+const bits = <<1:2, 3:4>>
+",
+        find_position_of(",")
+    );
+}
+
+#[test]
+fn hover_for_constant_bit_array_segment() {
+    assert_hover!(
+        "
+const bits = <<1:2, 3:4>>
+",
+        find_position_of("1")
+    );
+}
+
+#[test]
+fn hover_for_constant_bit_array_segment_option() {
+    assert_hover!(
+        "
+const bits = <<1:size(2), 3:4>>
+",
+        find_position_of("2")
+    );
+}
+
+#[test]
+fn hover_for_nested_constant() {
+    assert_hover!(
+        "
+type Wibble {
+  Wibble
+  Wobble(BitArray)
+}
+
+const value = #(1, 2, [Wibble, Wobble(<<1, 2, 3>>), Wibble])
+",
+        find_position_of("3")
+    );
+}
+
+#[test]
+fn record_field_documentation() {
+    assert_hover!(
+        "
+pub type Wibble {
+  Wibble(
+    /// This is some documentation about the wibble field.
+    wibble: Int
+  )
+}
+
+pub fn wibble(w: Wibble) {
+  w.wibble
+}
+",
+        find_position_of("w.wibble").under_char('l')
+    );
+}
+
+#[test]
+fn no_documentation_for_shared_record_field() {
+    assert_hover!(
+        "
+pub type Wibble {
+  Wibble(
+    /// This is some documentation about the wibble field.
+    wibble: Int
+  )
+  Wobble(
+    /// Here's some documentation explaining a field of Wobble
+    wibble: Int
+  )
+}
+
+pub fn wibble(w: Wibble) {
+  w.wibble
+}
+",
+        find_position_of("w.wibble").under_char('l')
+    );
+}
+
+#[test]
+fn documentation_for_shared_record_field_when_variant_is_known() {
+    assert_hover!(
+        "
+pub type Wibble {
+  Wibble(
+    /// This is some documentation about the wibble field.
+    wibble: Int
+  )
+  Wobble(
+    /// This won't show up because it's a Wibble variant
+    wibble: Int
+  )
+}
+
+pub fn wibble(w: Wibble) {
+  let assert Wibble(..) = w
+  w.wibble
+}
+",
+        find_position_of("w.wibble").under_char('l')
+    );
+}

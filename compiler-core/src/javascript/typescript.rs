@@ -11,8 +11,9 @@
 //! <https://www.typescriptlang.org/>
 //! <https://www.typescriptlang.org/docs/handbook/declaration-files/introduction.html>
 
-use crate::ast::{AssignName, Publicity};
-use crate::type_::{PRELUDE_MODULE_NAME, is_prelude_module};
+use crate::ast::{AssignName, Publicity, SrcSpan};
+use crate::javascript::import::Member;
+use crate::type_::{PRELUDE_MODULE_NAME, RecordAccessor, is_prelude_module};
 use crate::{
     ast::{
         CustomType, Definition, Function, Import, ModuleConstant, TypeAlias, TypedArg,
@@ -27,7 +28,7 @@ use ecow::{EcoString, eco_format};
 use itertools::Itertools;
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
-use super::{INDENT, Output, import::Imports, join, line, lines, wrap_args};
+use super::{INDENT, concat, import::Imports, join, line, lines, wrap_arguments};
 
 /// When rendering a type variable to an TypeScript type spec we need all type
 /// variables with the same id to end up with the same name in the generated
@@ -66,7 +67,7 @@ fn name_with_generics<'a>(
         if generic_names.is_empty() {
             super::nil()
         } else {
-            wrap_generic_args(generic_names)
+            wrap_generic_arguments(generic_names)
         },
     ]
 }
@@ -99,14 +100,14 @@ fn generic_ids(type_: &Type, ids: &mut HashMap<u64, u64>) {
             }
             TypeVar::Link { type_ } => generic_ids(type_, ids),
         },
-        Type::Named { args, .. } => {
-            for arg in args {
-                generic_ids(arg, ids)
+        Type::Named { arguments, .. } => {
+            for argument in arguments {
+                generic_ids(argument, ids)
             }
         }
-        Type::Fn { args, return_ } => {
-            for arg in args {
-                generic_ids(arg, ids)
+        Type::Fn { arguments, return_ } => {
+            for argument in arguments {
+                generic_ids(argument, ids)
             }
             generic_ids(return_, ids);
         }
@@ -129,12 +130,12 @@ fn tuple<'a>(elements: impl IntoIterator<Item = Document<'a>>) -> Document<'a> {
         .group()
 }
 
-fn wrap_generic_args<'a, I>(args: I) -> Document<'a>
+fn wrap_generic_arguments<'a, I>(arguments: I) -> Document<'a>
 where
     I: IntoIterator<Item = Document<'a>>,
 {
     break_("", "")
-        .append(join(args, break_(",", ", ")))
+        .append(join(arguments, break_(",", ", ")))
         .nest(INDENT)
         .append(break_("", ""))
         .surround("<", ">")
@@ -191,17 +192,16 @@ impl<'a> TypeScriptGenerator<'a> {
         }
     }
 
-    pub fn compile(&mut self) -> Output<'a> {
+    pub fn compile(&mut self) -> Document<'a> {
         let mut imports = self.collect_imports();
         let statements = self
             .module
             .definitions
             .iter()
-            .flat_map(|s| self.statement(s));
+            .flat_map(|definition| self.definition(definition, &mut imports));
 
         // Two lines between each statement
-        let mut statements: Vec<_> =
-            Itertools::intersperse(statements, Ok(lines(2))).try_collect()?;
+        let mut statements = Itertools::intersperse(statements, lines(2)).collect_vec();
 
         // Put it all together
 
@@ -211,19 +211,19 @@ impl<'a> TypeScriptGenerator<'a> {
         }
 
         if imports.is_empty() && statements.is_empty() {
-            Ok(docvec!["export {}", line()])
+            docvec!["export {}", line()]
         } else if imports.is_empty() {
             statements.push(line());
-            Ok(statements.to_doc())
+            statements.to_doc()
         } else if statements.is_empty() {
-            Ok(imports.into_doc(JavaScriptCodegenTarget::TypeScriptDeclarations))
+            imports.into_doc(JavaScriptCodegenTarget::TypeScriptDeclarations)
         } else {
-            Ok(docvec![
+            docvec![
                 imports.into_doc(JavaScriptCodegenTarget::TypeScriptDeclarations),
                 line(),
                 statements,
                 line()
-            ])
+            ]
         }
     }
 
@@ -289,7 +289,7 @@ impl<'a> TypeScriptGenerator<'a> {
             Type::Named {
                 package,
                 module,
-                args,
+                arguments,
                 ..
             } => {
                 let is_prelude = module == "gleam" && package.is_empty();
@@ -299,13 +299,13 @@ impl<'a> TypeScriptGenerator<'a> {
                     self.register_import(imports, package, module);
                 }
 
-                for arg in args {
-                    self.collect_imports_for_type(arg, imports);
+                for argument in arguments {
+                    self.collect_imports_for_type(argument, imports);
                 }
             }
-            Type::Fn { args, return_ } => {
-                for arg in args {
-                    self.collect_imports_for_type(arg, imports);
+            Type::Fn { arguments, return_ } => {
+                for argument in arguments {
+                    self.collect_imports_for_type(argument, imports);
                 }
                 self.collect_imports_for_type(return_, imports);
             }
@@ -364,8 +364,12 @@ impl<'a> TypeScriptGenerator<'a> {
         }
     }
 
-    fn statement(&mut self, statement: &'a TypedDefinition) -> Vec<Output<'a>> {
-        match statement {
+    fn definition(
+        &mut self,
+        definition: &'a TypedDefinition,
+        imports: &mut Imports<'_>,
+    ) -> Vec<Document<'a>> {
+        match definition {
             Definition::TypeAlias(TypeAlias {
                 alias,
                 publicity,
@@ -382,14 +386,17 @@ impl<'a> TypeScriptGenerator<'a> {
                 opaque,
                 name,
                 typed_parameters,
+                external_javascript,
                 ..
-            }) => self.custom_type_definition(
+            }) if publicity.is_importable() => self.custom_type_definition(
                 name,
                 typed_parameters,
                 constructors,
                 *opaque,
-                publicity,
+                external_javascript,
+                imports,
             ),
+            Definition::CustomType(CustomType { .. }) => vec![],
 
             Definition::ModuleConstant(ModuleConstant {
                 publicity,
@@ -412,14 +419,14 @@ impl<'a> TypeScriptGenerator<'a> {
         }
     }
 
-    fn type_alias(&mut self, alias: &str, type_: &Type) -> Output<'a> {
-        Ok(docvec![
+    fn type_alias(&mut self, alias: &str, type_: &Type) -> Document<'a> {
+        docvec![
             "export type ",
             ts_safe_type_name(alias.to_string()),
             " = ",
             self.print_type(type_),
             ";"
-        ])
+        ]
     }
 
     /// Converts a Gleam custom type definition into the TypeScript equivalent.
@@ -436,18 +443,44 @@ impl<'a> TypeScriptGenerator<'a> {
         typed_parameters: &'a [Arc<Type>],
         constructors: &'a [TypedRecordConstructor],
         opaque: bool,
-        publicity: &Publicity,
-    ) -> Vec<Output<'a>> {
+        external: &'a Option<(EcoString, EcoString, SrcSpan)>,
+        imports: &mut Imports<'_>,
+    ) -> Vec<Document<'a>> {
         // Constructors for opaque and private types are not exported
-        let export_constructors = !opaque && publicity.is_importable();
+        let constructor_publicity = if opaque {
+            Publicity::Private
+        } else {
+            Publicity::Public
+        };
 
-        let mut definitions: Vec<Output<'_>> = constructors
+        let type_name = name_with_generics(eco_format!("{name}$").to_doc(), typed_parameters);
+
+        let mut definitions = constructors
             .iter()
-            .map(|constructor| Ok(self.record_definition(constructor, export_constructors)))
-            .collect();
+            .map(|constructor| {
+                self.variant_definition(
+                    constructor,
+                    constructor_publicity,
+                    name,
+                    &type_name,
+                    typed_parameters,
+                )
+            })
+            .collect_vec();
 
         let definition = if constructors.is_empty() {
-            "any".to_doc()
+            if let Some((module, external_name, _location)) = external {
+                let member = Member {
+                    name: external_name.to_doc(),
+                    alias: Some(eco_format!("{name}$").to_doc()),
+                };
+                imports.register_export(eco_format!("{name}$"));
+
+                imports.register_module(module.clone(), [], [member]);
+                return Vec::new();
+            } else {
+                "any".to_doc()
+            }
         } else {
             let constructors = constructors.iter().map(|x| {
                 name_with_generics(
@@ -458,30 +491,87 @@ impl<'a> TypeScriptGenerator<'a> {
             join(constructors, break_("| ", " | "))
         };
 
-        definitions.push(Ok(docvec![
-            if publicity.is_importable() {
-                "export ".to_doc()
-            } else {
-                "declare ".to_doc()
-            },
-            "type ",
-            name_with_generics(eco_format!("{name}$").to_doc(), typed_parameters),
+        definitions.push(docvec![
+            "export type ",
+            type_name.clone(),
             " = ",
             definition,
             ";",
-        ]));
+        ]);
+
+        // Generate getters for fields shared between variants
+        if let Some(accessors_map) = self.module.type_info.accessors.get(name)
+            && !accessors_map.shared_accessors.is_empty()
+            // Don't bother generating shared getters when there's only one variant,
+            // since the specific accessors can always be uses instead.
+            && constructors.len() != 1
+            // Only generate accessors for the API if the constructors are public
+            && constructor_publicity.is_public()
+        {
+            definitions.push(self.shared_custom_type_fields(
+                name,
+                &type_name,
+                typed_parameters,
+                &accessors_map.shared_accessors,
+            ));
+        }
 
         definitions
     }
 
-    fn record_definition(
+    fn variant_definition(
         &mut self,
         constructor: &'a TypedRecordConstructor,
-        export: bool,
+        publicity: Publicity,
+        type_name: &'a str,
+        type_name_with_generics: &Document<'a>,
+        type_parameters: &'a [Arc<Type>],
     ) -> Document<'a> {
         self.set_prelude_used();
+        let class_definition = self.variant_class_definition(constructor, publicity);
+
+        // If the custom type is private or opaque, we don't need to generate API
+        // functions for it.
+        if publicity.is_private() {
+            return class_definition;
+        }
+
+        let constructor_definition = self.variant_constructor_definition(
+            constructor,
+            type_name,
+            type_name_with_generics,
+            type_parameters,
+        );
+        let variant_check_definition = self.variant_check_definition(
+            constructor,
+            type_name,
+            type_name_with_generics,
+            type_parameters,
+        );
+        let fields_definition = self.variant_fields_definition(
+            constructor,
+            type_name,
+            type_name_with_generics,
+            type_parameters,
+        );
+
+        docvec![
+            class_definition,
+            line(),
+            constructor_definition,
+            line(),
+            variant_check_definition,
+            fields_definition,
+        ]
+    }
+
+    fn variant_class_definition(
+        &mut self,
+        constructor: &'a TypedRecordConstructor,
+        publicity: Publicity,
+    ) -> Document<'a> {
         let head = docvec![
-            if export {
+            if publicity.is_public() {
                 "export ".to_doc()
             } else {
                 "declare ".to_doc()
@@ -500,19 +590,30 @@ impl<'a> TypeScriptGenerator<'a> {
 
         let class_body = docvec![
             line(),
+            "/** @deprecated */",
+            line(),
             // First add the constructor
             "constructor",
-            wrap_args(constructor.arguments.iter().enumerate().map(|(i, arg)| {
-                let name = arg
-                    .label
-                    .as_ref()
-                    .map(|(_, s)| super::maybe_escape_identifier(s))
-                    .unwrap_or_else(|| eco_format!("argument${i}"))
-                    .to_doc();
-                docvec![name, ": ", self.do_print_force_generic_param(&arg.type_)]
-            })),
+            wrap_arguments(
+                constructor
+                    .arguments
+                    .iter()
+                    .enumerate()
+                    .map(|(i, argument)| {
+                        let name = argument
+                            .label
+                            .as_ref()
+                            .map(|(_, s)| super::maybe_escape_identifier(s))
+                            .unwrap_or_else(|| eco_format!("argument${i}"))
+                            .to_doc();
+                        docvec![
+                            name,
+                            ": ",
+                            self.do_print_force_generic_param(&argument.type_)
+                        ]
+                    })
+            ),
             ";",
-            line(),
             line(),
             // Then add each field to the class
             join(
@@ -524,6 +625,8 @@ impl<'a> TypeScriptGenerator<'a> {
                         .unwrap_or_else(|| eco_format!("{i}"))
                         .to_doc();
                     docvec![
+                        "/** @deprecated */",
+                        line(),
                         name,
                         ": ",
                         self.do_print_force_generic_param(&arg.type_),
@@ -538,25 +641,190 @@ impl<'a> TypeScriptGenerator<'a> {
         docvec![head, class_body, line(), "}"]
     }
 
-    fn module_constant(&mut self, name: &'a EcoString, value: &'a TypedConstant) -> Output<'a> {
-        Ok(docvec![
+    fn variant_constructor_definition(
+        &mut self,
+        constructor: &'a TypedRecordConstructor,
+        type_name: &'a str,
+        type_name_with_generics: &Document<'a>,
+        type_parameters: &'a [Arc<Type>],
+    ) -> Document<'a> {
+        let mut arguments = Vec::new();
+
+        for (index, parameter) in constructor.arguments.iter().enumerate() {
+            let name = if let Some((_, label)) = &parameter.label {
+                super::maybe_escape_identifier(label)
+            } else {
+                eco_format!("${index}")
+            };
+
+            arguments.push(docvec![
+                name,
+                ": ",
+                self.do_print_force_generic_param(&parameter.type_)
+            ])
+        }
+
+        let function_name = eco_format!(
+            "{type_name}${variant_name}",
+            variant_name = constructor.name
+        )
+        .to_doc();
+
+        let has_arguments = !arguments.is_empty();
+
+        docvec![
+            "export function ",
+            name_with_generics(function_name, type_parameters),
+            "(",
+            docvec![break_("", ""), join(arguments, break_(",", ", ")),].nest(INDENT),
+            break_(if has_arguments { "," } else { "" }, ""),
+            "): ",
+            type_name_with_generics.clone(),
+            ";"
+        ]
+        .group()
+    }
+
+    fn variant_check_definition(
+        &self,
+        constructor: &'a TypedRecordConstructor,
+        type_name: &'a str,
+        type_name_with_generics: &Document<'a>,
+        type_parameters: &'a [Arc<Type>],
+    ) -> Document<'a> {
+        let function_name = eco_format!(
+            "{type_name}$is{variant_name}",
+            variant_name = constructor.name
+        )
+        .to_doc();
+
+        docvec![
+            "export function ",
+            name_with_generics(function_name, type_parameters),
+            "(",
+            docvec![break_("", "",), "value: ", type_name_with_generics.clone(),].nest(INDENT),
+            break_(",", ""),
+            "): boolean;",
+        ]
+        .group()
+    }
+
+    fn variant_fields_definition(
+        &mut self,
+        constructor: &'a TypedRecordConstructor,
+        type_name: &'a str,
+        type_name_with_generics: &Document<'a>,
+        type_parameters: &'a [Arc<Type>],
+    ) -> Document<'a> {
+        let mut functions = Vec::new();
+
+        for (index, argument) in constructor.arguments.iter().enumerate() {
+            // Always generate the accessor for the value at this index. Although
+            // this is not necessary when a label is present, we want to make sure
+            // that adding a label to a record isn't a breaking change. For this
+            // reason, we need to generate an index getter even when a label is
+            // present to ensure consistent behaviour between labelled and unlabelled
+            // field access.
+            let function_name = eco_format!(
+                "{type_name}${variant_name}${index}",
+                variant_name = constructor.name
+            )
+            .to_doc();
+
+            functions.push(
+                docvec![
+                    line(),
+                    "export function ",
+                    name_with_generics(function_name, type_parameters),
+                    "(",
+                    docvec![break_("", "",), "value: ", type_name_with_generics.clone(),]
+                        .nest(INDENT),
+                    break_(",", ""),
+                    "): ",
+                    self.do_print_force_generic_param(&argument.type_),
+                    ";",
+                ]
+                .group(),
+            );
+
+            // If the argument is labelled, also generate a getter for the labelled
+            // argument.
+            if let Some((_, label)) = &argument.label {
+                let function_name = eco_format!(
+                    "{type_name}${variant_name}${label}",
+                    variant_name = constructor.name
+                )
+                .to_doc();
+
+                functions.push(
+                    docvec![
+                        line(),
+                        "export function ",
+                        name_with_generics(function_name, type_parameters),
+                        "(",
+                        docvec![break_("", "",), "value: ", type_name_with_generics.clone(),]
+                            .nest(INDENT),
+                        break_(",", ""),
+                        "): ",
+                        self.do_print_force_generic_param(&argument.type_),
+                        ";",
+                    ]
+                    .group(),
+                );
+            }
+        }
+
+        concat(functions)
+    }
+
+    fn shared_custom_type_fields(
+        &mut self,
+        type_name: &'a str,
+        type_name_with_generics: &Document<'a>,
+        type_parameters: &'a [Arc<Type>],
+        shared_accessors: &HashMap<EcoString, RecordAccessor>,
+    ) -> Document<'a> {
+        let accessors = shared_accessors
+            .iter()
+            .sorted_by_key(|(name, _)| *name)
+            .map(|(field, accessor)| {
+                let function_name = eco_format!("{type_name}${field}").to_doc();
+
+                docvec![
+                    "export function ",
+                    name_with_generics(function_name, type_parameters),
+                    "(",
+                    docvec![break_("", "",), "value: ", type_name_with_generics.clone(),]
+                        .nest(INDENT),
+                    break_(",", ""),
+                    "): ",
+                    self.do_print_force_generic_param(&accessor.type_),
+                    ";"
+                ]
+                .group()
+            });
+        join(accessors, line())
+    }
+
+    fn module_constant(&mut self, name: &'a EcoString, value: &'a TypedConstant) -> Document<'a> {
+        docvec![
             "export const ",
             super::maybe_escape_identifier(name),
             ": ",
             self.print_type(&value.type_()),
             ";",
-        ])
+        ]
     }
 
     fn module_function(
         &mut self,
         name: &'a EcoString,
-        args: &'a [TypedArg],
+        arguments: &'a [TypedArg],
         return_type: &'a Arc<Type>,
-    ) -> Output<'a> {
+    ) -> Document<'a> {
         let generic_usages = collect_generic_usages(
             HashMap::new(),
-            std::iter::once(return_type).chain(args.iter().map(|a| &a.type_)),
+            std::iter::once(return_type).chain(arguments.iter().map(|a| &a.type_)),
         );
         let generic_names: Vec<Document<'_>> = generic_usages
             .iter()
@@ -565,37 +833,35 @@ impl<'a> TypeScriptGenerator<'a> {
             .map(|(id, _use_count)| id_to_type_var(*id))
             .collect();
 
-        Ok(docvec![
+        docvec![
             "export function ",
             super::maybe_escape_identifier(name),
             if generic_names.is_empty() {
                 super::nil()
             } else {
-                wrap_generic_args(generic_names)
+                wrap_generic_arguments(generic_names)
             },
-            wrap_args(
-                args.iter()
-                    .enumerate()
-                    .map(|(i, a)| match a.get_variable_name() {
-                        None => {
-                            docvec![
-                                "x",
-                                i,
-                                ": ",
-                                self.print_type_with_generic_usages(&a.type_, &generic_usages)
-                            ]
-                        }
-                        Some(name) => docvec![
-                            super::maybe_escape_identifier(name),
+            wrap_arguments(arguments.iter().enumerate().map(|(i, argument)| {
+                match argument.get_variable_name() {
+                    None => {
+                        docvec![
+                            "x",
+                            i,
                             ": ",
-                            self.print_type_with_generic_usages(&a.type_, &generic_usages)
-                        ],
-                    }),
-            ),
+                            self.print_type_with_generic_usages(&argument.type_, &generic_usages)
+                        ]
+                    }
+                    Some(name) => docvec![
+                        super::maybe_escape_identifier(name),
+                        ": ",
+                        self.print_type_with_generic_usages(&argument.type_, &generic_usages)
+                    ],
+                }
+            }),),
             ": ",
             self.print_type_with_generic_usages(return_type, &generic_usages),
             ";",
-        ])
+        ]
     }
 
     /// Converts a Gleam type into a TypeScript type string
@@ -641,14 +907,22 @@ impl<'a> TypeScriptGenerator<'a> {
             Type::Var { type_ } => self.print_var(&type_.borrow(), generic_usages, false),
 
             Type::Named {
-                name, module, args, ..
-            } if is_prelude_module(module) => self.print_prelude_type(name, args, generic_usages),
+                name,
+                module,
+                arguments,
+                ..
+            } if is_prelude_module(module) => {
+                self.print_prelude_type(name, arguments, generic_usages)
+            }
 
             Type::Named {
-                name, args, module, ..
-            } => self.print_type_app(name, args, module, generic_usages),
+                name,
+                arguments,
+                module,
+                ..
+            } => self.print_type_app(name, arguments, module, generic_usages),
 
-            Type::Fn { args, return_ } => self.print_fn(args, return_, generic_usages),
+            Type::Fn { arguments, return_ } => self.print_fn(arguments, return_, generic_usages),
 
             Type::Tuple { elements } => tuple(
                 elements
@@ -663,14 +937,20 @@ impl<'a> TypeScriptGenerator<'a> {
             Type::Var { type_ } => self.print_var(&type_.borrow(), None, true),
 
             Type::Named {
-                name, module, args, ..
-            } if is_prelude_module(module) => self.print_prelude_type(name, args, None),
+                name,
+                module,
+                arguments,
+                ..
+            } if is_prelude_module(module) => self.print_prelude_type(name, arguments, None),
 
             Type::Named {
-                name, args, module, ..
-            } => self.print_type_app(name, args, module, None),
+                name,
+                arguments,
+                module,
+                ..
+            } => self.print_type_app(name, arguments, module, None),
 
-            Type::Fn { args, return_ } => self.print_fn(args, return_, None),
+            Type::Fn { arguments, return_ } => self.print_fn(arguments, return_, None),
 
             Type::Tuple { elements } => {
                 tuple(elements.iter().map(|element| self.do_print(element, None)))
@@ -711,7 +991,7 @@ impl<'a> TypeScriptGenerator<'a> {
     fn print_prelude_type(
         &mut self,
         name: &str,
-        args: &[Arc<Type>],
+        arguments: &[Arc<Type>],
         generic_usages: Option<&HashMap<u64, u64>>,
     ) -> Document<'static> {
         match name {
@@ -731,14 +1011,20 @@ impl<'a> TypeScriptGenerator<'a> {
                 self.tracker.prelude_used = true;
                 docvec![
                     "_.List",
-                    wrap_generic_args(args.iter().map(|x| self.do_print(x, generic_usages)))
+                    wrap_generic_arguments(
+                        arguments
+                            .iter()
+                            .map(|argument| self.do_print(argument, generic_usages))
+                    )
                 ]
             }
             "Result" => {
                 self.tracker.prelude_used = true;
                 docvec![
                     "_.Result",
-                    wrap_generic_args(args.iter().map(|x| self.do_print(x, generic_usages)))
+                    wrap_generic_arguments(
+                        arguments.iter().map(|x| self.do_print(x, generic_usages))
+                    )
                 ]
             }
             // Getting here should mean we either forgot a built-in type or there is a
@@ -753,7 +1039,7 @@ impl<'a> TypeScriptGenerator<'a> {
     fn print_type_app(
         &mut self,
         name: &str,
-        args: &[Arc<Type>],
+        arguments: &[Arc<Type>],
         module: &str,
         generic_usages: Option<&HashMap<u64, u64>>,
     ) -> Document<'static> {
@@ -766,14 +1052,18 @@ impl<'a> TypeScriptGenerator<'a> {
                 docvec![self.module_name(module), ".", name]
             }
         };
-        if args.is_empty() {
+        if arguments.is_empty() {
             return name;
         }
 
         // If the App type takes arguments, pass them in as TypeScript generics
         docvec![
             name,
-            wrap_generic_args(args.iter().map(|a| self.do_print(a, generic_usages)))
+            wrap_generic_arguments(
+                arguments
+                    .iter()
+                    .map(|argument| self.do_print(argument, generic_usages))
+            )
         ]
     }
 
@@ -781,16 +1071,16 @@ impl<'a> TypeScriptGenerator<'a> {
     ///
     fn print_fn(
         &mut self,
-        args: &[Arc<Type>],
+        arguments: &[Arc<Type>],
         return_: &Type,
         generic_usages: Option<&HashMap<u64, u64>>,
     ) -> Document<'static> {
         docvec![
-            wrap_args(args.iter().enumerate().map(|(idx, a)| docvec![
+            wrap_arguments(arguments.iter().enumerate().map(|(idx, argument)| docvec![
                 "x",
                 idx,
                 ": ",
-                self.do_print(a, generic_usages)
+                self.do_print(argument, generic_usages)
             ])),
             " => ",
             self.do_print(return_, generic_usages)

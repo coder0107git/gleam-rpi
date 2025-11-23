@@ -1,20 +1,26 @@
 use std::collections::HashMap;
 
 use ecow::EcoString;
-use lsp_types::{RenameParams, TextEdit, Url, WorkspaceEdit};
+use lsp_server::ResponseError;
+use lsp_types::{Range, RenameParams, TextEdit, Url, WorkspaceEdit};
 
 use crate::{
     analyse::name,
-    ast::{self, SrcSpan},
+    ast::{self, Definition, SrcSpan},
     build::Module,
+    language_server::{
+        edits::{
+            self, Newlines, add_newlines_after_import, position_of_first_definition_if_import,
+        },
+        reference::FindVariableReferences,
+    },
     line_numbers::LineNumbers,
     reference::ReferenceKind,
     type_::{ModuleInterface, error::Named},
 };
 
 use super::{
-    TextEdits, compiler::ModuleSourceInformation, reference::find_variable_references,
-    url_from_path,
+    TextEdits, compiler::ModuleSourceInformation, reference::VariableReferenceKind, url_from_path,
 };
 
 fn workspace_edit(uri: Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
@@ -28,9 +34,32 @@ fn workspace_edit(uri: Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
     }
 }
 
-pub enum VariableRenameKind {
-    Variable,
-    LabelShorthand,
+pub enum RenameOutcome {
+    InvalidName { name: EcoString },
+    NoRenames,
+    Renamed { edit: WorkspaceEdit },
+}
+
+/// Error code for when a request has invalid params as described in:
+/// https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#errorCodes
+///
+const INVALID_PARAMS: i32 = -32602;
+
+impl RenameOutcome {
+    /// Turns the outcome of renaming into a value that's suitable to be used as
+    /// a response in the language server engine.
+    ///
+    pub fn into_result(self) -> Result<Option<WorkspaceEdit>, ResponseError> {
+        match self {
+            RenameOutcome::NoRenames => Ok(None),
+            RenameOutcome::Renamed { edit } => Ok(Some(edit)),
+            RenameOutcome::InvalidName { name } => Err(ResponseError {
+                code: INVALID_PARAMS,
+                message: format!("{name} is not a valid name"),
+                data: None,
+            }),
+        }
+    }
 }
 
 pub fn rename_local_variable(
@@ -38,35 +67,43 @@ pub fn rename_local_variable(
     line_numbers: &LineNumbers,
     params: &RenameParams,
     definition_location: SrcSpan,
-    kind: VariableRenameKind,
-) -> Option<WorkspaceEdit> {
-    if name::check_name_case(
-        Default::default(),
-        &params.new_name.as_str().into(),
-        Named::Variable,
-    )
-    .is_err()
-    {
-        return None;
+    name: EcoString,
+    kind: VariableReferenceKind,
+) -> RenameOutcome {
+    let new_name = EcoString::from(&params.new_name);
+    if name::check_name_case(Default::default(), &new_name, Named::Variable).is_err() {
+        return RenameOutcome::InvalidName { name: new_name };
     }
 
     let uri = params.text_document_position.text_document.uri.clone();
     let mut edits = TextEdits::new(line_numbers);
 
-    let references = find_variable_references(&module.ast, definition_location);
+    let references =
+        FindVariableReferences::new(definition_location, name).find_in_module(&module.ast);
 
     match kind {
-        VariableRenameKind::Variable => edits.replace(definition_location, params.new_name.clone()),
-        VariableRenameKind::LabelShorthand => {
+        VariableReferenceKind::Variable => {
+            edits.replace(definition_location, params.new_name.clone())
+        }
+        VariableReferenceKind::LabelShorthand => {
             edits.insert(definition_location.end, format!(" {}", params.new_name))
         }
     }
 
-    for location in references {
-        edits.replace(location, params.new_name.clone());
+    for reference in references {
+        match reference.kind {
+            VariableReferenceKind::Variable => {
+                edits.replace(reference.location, params.new_name.clone())
+            }
+            VariableReferenceKind::LabelShorthand => {
+                edits.insert(reference.location.end, format!(" {}", params.new_name))
+            }
+        }
     }
 
-    Some(workspace_edit(uri, edits.edits))
+    RenameOutcome::Renamed {
+        edit: workspace_edit(uri, edits.edits),
+    }
 }
 
 pub enum RenameTarget {
@@ -89,17 +126,18 @@ pub fn rename_module_entity(
     modules: &im::HashMap<EcoString, ModuleInterface>,
     sources: &HashMap<EcoString, ModuleSourceInformation>,
     renamed: Renamed<'_>,
-) -> Option<WorkspaceEdit> {
+) -> RenameOutcome {
+    let new_name = EcoString::from(&params.new_name);
     if name::check_name_case(
         // We don't care about the actual error here, just whether the name is valid,
         // so we just use the default span.
         SrcSpan::default(),
-        &params.new_name.as_str().into(),
+        &new_name,
         renamed.name_kind,
     )
     .is_err()
     {
-        return None;
+        return RenameOutcome::InvalidName { name: new_name };
     }
 
     match renamed.target_kind {
@@ -144,7 +182,9 @@ pub fn rename_module_entity(
         }
     }
 
-    Some(workspace_edit)
+    RenameOutcome::Renamed {
+        edit: workspace_edit,
+    }
 }
 
 fn rename_references_in_module(
@@ -193,15 +233,18 @@ fn alias_references_in_module(
     module_name: &EcoString,
     name: &EcoString,
     layer: ast::Layer,
-) -> Option<WorkspaceEdit> {
+) -> RenameOutcome {
     let reference_map = match layer {
         ast::Layer::Value => &module.ast.type_info.references.value_references,
         ast::Layer::Type => &module.ast.type_info.references.type_references,
     };
 
-    let references = reference_map.get(&(module_name.clone(), name.clone()))?;
+    let Some(references) = reference_map.get(&(module_name.clone(), name.clone())) else {
+        return RenameOutcome::NoRenames;
+    };
 
     let mut edits = TextEdits::new(&module.ast.type_info.line_numbers);
+    let mut found_import = false;
 
     for reference in references {
         match reference.kind {
@@ -210,14 +253,77 @@ fn alias_references_in_module(
                 edits.replace(reference.location, params.new_name.clone())
             }
             ReferenceKind::Import => {
-                edits.insert(reference.location.end, format!(" as {}", params.new_name))
+                edits.insert(reference.location.end, format!(" as {}", params.new_name));
+                found_import = true;
             }
             ReferenceKind::Definition => {}
         }
     }
 
-    Some(workspace_edit(
-        params.text_document_position.text_document.uri.clone(),
-        edits.edits,
-    ))
+    // If we didn't find the import for the aliased type or value, then this is
+    // a prelude value and we need to add the import so we can alias it.
+    if !found_import {
+        let unqualified_import = match layer {
+            ast::Layer::Value => format!("{name} as {}", params.new_name),
+            ast::Layer::Type => format!("type {name} as {}", params.new_name),
+        };
+
+        let mut import = None;
+        for definition in module.ast.definitions.iter() {
+            match definition {
+                Definition::Import(this_import) if this_import.module == *module_name => {
+                    import = Some(this_import);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(import) = import {
+            let (position, new_text) =
+                edits::insert_unqualified_import(import, &module.code, unqualified_import);
+            edits.insert(position, new_text);
+        } else {
+            add_import(module, module_name, unqualified_import, &mut edits);
+        }
+    }
+
+    RenameOutcome::Renamed {
+        edit: workspace_edit(
+            params.text_document_position.text_document.uri.clone(),
+            edits.edits,
+        ),
+    }
+}
+
+fn add_import(
+    module: &Module,
+    module_name: &EcoString,
+    unqualified_import: String,
+    edits: &mut TextEdits<'_>,
+) {
+    let position_of_first_import_if_present =
+        position_of_first_definition_if_import(module, &module.ast.type_info.line_numbers);
+    let first_is_import = position_of_first_import_if_present.is_some();
+    let import_location = position_of_first_import_if_present.unwrap_or_default();
+
+    let after_import_newlines = add_newlines_after_import(
+        import_location,
+        first_is_import,
+        &module.ast.type_info.line_numbers,
+        &module.code,
+    );
+
+    let newlines = match after_import_newlines {
+        Newlines::Single => "\n",
+        Newlines::Double => "\n\n",
+    };
+
+    edits.edits.push(TextEdit {
+        range: Range {
+            start: import_location,
+            end: import_location,
+        },
+        new_text: format!("import {module_name}.{{{unqualified_import}}}{newlines}",),
+    });
 }

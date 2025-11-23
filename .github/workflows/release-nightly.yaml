@@ -27,7 +27,7 @@ jobs:
     # TODO: Re-add
     # if: ${{ github.repository == 'gleam-lang/gleam' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: print latest_commit
         run: echo ${{ github.sha }}
 
@@ -56,6 +56,7 @@ jobs:
   build-release:
     name: build-release
     runs-on: ${{ matrix.os }}
+    environment: release
     outputs:
       release-id: ${{ steps.release.outputs.id }}
     strategy:
@@ -66,6 +67,7 @@ jobs:
           - x86_64-apple-darwin
           - aarch64-apple-darwin
           - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
         toolchain: [ stable ]
         include:
           - os: ubuntu-latest
@@ -85,16 +87,20 @@ jobs:
             target: aarch64-apple-darwin
             expected-binary-architecture: arm64
             cargo-tool: cargo
-          - os: windows-latest
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
             expected-binary-architecture: x86-64
+            cargo-tool: cargo
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            expected-binary-architecture: arm64
             cargo-tool: cargo
           - os: ubuntu-latest
             target: wasm32-unknown-unknown
             cargo-tool: wasm-pack
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Update versions
         shell: bash
@@ -109,12 +115,17 @@ jobs:
           target: ${{ matrix.target }}
           cargo-tool: ${{ matrix.cargo-tool }}
           expected-binary-architecture: ${{ matrix.expected-binary-architecture }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-trusted-signing-account-name: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          azure-certificate-profile-name: ${{ vars.AZURE_CERTIFICATE_PROFILE_NAME }}
 
       - name: Upload release archive
         id: release
         # https://github.com/softprops/action-gh-release/issues/445
         # uses: softprops/action-gh-release@v2
-        uses: softprops/action-gh-release@ab50eebb6488051c6788d97fa95232267c6a4e23
+        uses: softprops/action-gh-release@f2352b97da0095b4dbbd885a81023e3deabf4fef
         with:
           draft: false
           prerelease: true
@@ -148,7 +159,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           sparse-checkout: |
             .github/actions

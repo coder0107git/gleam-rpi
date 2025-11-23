@@ -37,7 +37,7 @@ pub type Wibble(value) {
   )
 }
 
-fn encode_wibble(wibble: Wibble(value)) -> json.Json {
+fn wibble_to_json(wibble: Wibble(value)) -> json.Json {
   let Wibble(maybe:, something:, map:, unknown:) = wibble
   json.object([
     #("maybe", case maybe {

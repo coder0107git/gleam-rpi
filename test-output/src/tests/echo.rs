@@ -135,6 +135,11 @@ fn echo_bool() {
 }
 
 #[test]
+fn echo_charlist() {
+    assert_echo!("echo_charlist");
+}
+
+#[test]
 fn echo_custom_type() {
     assert_echo!(Target::Erlang, "echo_custom_type");
     assert_echo!(Target::JavaScript, "echo_custom_type");
@@ -189,4 +194,19 @@ fn echo_tuple() {
 #[test]
 fn echo_non_record_atom_tag() {
     assert_echo!(Target::Erlang, "echo_non_record_atom_tag");
+}
+
+#[test]
+fn echo_circular_reference() {
+    assert_echo!(Target::JavaScript, "echo_circular_reference");
+}
+
+#[test]
+fn echo_singleton() {
+    assert_echo!("echo_singleton");
+}
+
+#[test]
+fn echo_with_message() {
+    assert_echo!("echo_with_message");
 }

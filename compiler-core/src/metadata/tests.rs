@@ -10,11 +10,14 @@ use crate::{
     },
     build::Origin,
     line_numbers::LineNumbers,
+    parse::LiteralFloatValue,
     reference::{Reference, ReferenceKind},
     type_::{
         self, Deprecation, ModuleInterface, Opaque, References, Type, TypeAliasConstructor,
         TypeConstructor, TypeValueConstructor, TypeValueConstructorField, TypeVariantConstructors,
-        ValueConstructor, ValueConstructorVariant, expression::Implementations, prelude,
+        ValueConstructor, ValueConstructorVariant,
+        expression::{Implementations, Purity},
+        prelude,
     },
     uid::UniqueIdGenerator,
 };
@@ -71,6 +74,7 @@ fn constant_module(constant: TypedConstant) -> ModuleInterface {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     }
 }
 
@@ -110,6 +114,7 @@ fn empty_module() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -138,6 +143,7 @@ fn with_line_numbers() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -174,6 +180,7 @@ fn module_with_private_type() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -210,6 +217,7 @@ fn module_with_app_type() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -246,6 +254,7 @@ fn module_with_fn_type() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -282,6 +291,7 @@ fn module_with_tuple_type() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -323,6 +333,7 @@ fn module_with_generic_type() {
             documentation: Vec::new(),
             contains_echo: false,
             references: References::default(),
+            inline_functions: HashMap::new(),
         }
     }
 
@@ -364,6 +375,7 @@ fn module_with_type_links() {
             documentation: Vec::new(),
             contains_echo: false,
             references: References::default(),
+            inline_functions: HashMap::new(),
         }
     }
 
@@ -405,6 +417,7 @@ fn module_with_type_constructor_documentation() {
             documentation: Vec::new(),
             contains_echo: false,
             references: References::default(),
+            inline_functions: HashMap::new(),
         }
     }
 
@@ -449,6 +462,7 @@ fn module_with_type_constructor_origin() {
             documentation: Vec::new(),
             contains_echo: false,
             references: References::default(),
+            inline_functions: HashMap::new(),
         }
     }
 
@@ -487,6 +501,7 @@ fn module_type_to_constructors_mapping() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -528,6 +543,7 @@ fn module_fn_value() {
                         can_run_on_erlang: true,
                         can_run_on_javascript: true,
                     },
+                    purity: Purity::Pure,
                 },
             },
         )]
@@ -540,6 +556,7 @@ fn module_fn_value() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -582,6 +599,7 @@ fn deprecated_module_fn_value() {
                         can_run_on_erlang: true,
                         can_run_on_javascript: true,
                     },
+                    purity: Purity::Pure,
                 },
             },
         )]
@@ -594,6 +612,7 @@ fn deprecated_module_fn_value() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -634,6 +653,7 @@ fn private_module_fn_value() {
                         can_run_on_erlang: true,
                         can_run_on_javascript: true,
                     },
+                    purity: Purity::Pure,
                 },
             },
         )]
@@ -646,6 +666,7 @@ fn private_module_fn_value() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -688,6 +709,7 @@ fn module_fn_value_regression() {
                         can_run_on_erlang: true,
                         can_run_on_javascript: true,
                     },
+                    purity: Purity::TrustedPure,
                 },
             },
         )]
@@ -700,6 +722,7 @@ fn module_fn_value_regression() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -741,6 +764,7 @@ fn module_fn_value_with_field_map() {
                         can_run_on_erlang: true,
                         can_run_on_javascript: true,
                     },
+                    purity: Purity::Pure,
                 },
             },
         )]
@@ -753,6 +777,7 @@ fn module_fn_value_with_field_map() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -760,7 +785,7 @@ fn module_fn_value_with_field_map() {
 
 #[test]
 fn record_value() {
-    let mut random = rand::thread_rng();
+    let mut random = rand::rng();
 
     let module = ModuleInterface {
         warnings: vec![],
@@ -782,13 +807,13 @@ fn record_value() {
                     name: "one".into(),
                     module: "themodule".into(),
                     field_map: None,
-                    arity: random.r#gen(),
-                    variants_count: random.r#gen(),
+                    arity: random.random(),
+                    variants_count: random.random(),
                     location: SrcSpan {
-                        start: random.r#gen(),
-                        end: random.r#gen(),
+                        start: random.random(),
+                        end: random.random(),
                     },
-                    variant_index: random.r#gen(),
+                    variant_index: random.random(),
                 },
             },
         )]
@@ -801,6 +826,7 @@ fn record_value() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -808,7 +834,7 @@ fn record_value() {
 
 #[test]
 fn record_value_with_field_map() {
-    let mut random = rand::thread_rng();
+    let mut random = rand::rng();
 
     let module = ModuleInterface {
         warnings: vec![],
@@ -830,16 +856,19 @@ fn record_value_with_field_map() {
                     module: "themodule".into(),
                     name: "one".into(),
                     field_map: Some(FieldMap {
-                        arity: random.r#gen(),
-                        fields: [("ok".into(), random.r#gen()), ("ko".into(), random.r#gen())]
-                            .into(),
+                        arity: random.random(),
+                        fields: [
+                            ("ok".into(), random.random()),
+                            ("ko".into(), random.random()),
+                        ]
+                        .into(),
                     }),
-                    arity: random.r#gen(),
-                    variants_count: random.r#gen(),
-                    variant_index: random.r#gen(),
+                    arity: random.random(),
+                    variants_count: random.random(),
+                    variant_index: random.random(),
                     location: SrcSpan {
-                        start: random.r#gen(),
-                        end: random.r#gen(),
+                        start: random.random(),
+                        end: random.random(),
                     },
                 },
             },
@@ -853,6 +882,7 @@ fn record_value_with_field_map() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -867,6 +897,7 @@ fn accessors() {
                 index: 6,
                 label: "siiixxx".into(),
                 type_: type_::nil(),
+                documentation: Some("Here is some documentation".into()),
             },
         ),
         (
@@ -875,6 +906,7 @@ fn accessors() {
                 index: 5,
                 label: "fiveee".into(),
                 type_: type_::float(),
+                documentation: None,
             },
         ),
     ];
@@ -885,6 +917,7 @@ fn accessors() {
             index: 1,
             label: "ok".into(),
             type_: type_::float(),
+            documentation: Some("Documentation for the ok field".into()),
         },
     )];
 
@@ -926,6 +959,7 @@ fn accessors() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -940,6 +974,7 @@ fn private_accessors() {
                 index: 6,
                 label: "siiixxx".into(),
                 type_: type_::nil(),
+                documentation: None,
             },
         ),
         (
@@ -948,6 +983,7 @@ fn private_accessors() {
                 index: 5,
                 label: "fiveee".into(),
                 type_: type_::float(),
+                documentation: None,
             },
         ),
     ];
@@ -958,6 +994,7 @@ fn private_accessors() {
             index: 1,
             label: "ok".into(),
             type_: type_::float(),
+            documentation: None,
         },
     )];
 
@@ -998,6 +1035,7 @@ fn private_accessors() {
         type_aliases: HashMap::new(),
         documentation: Vec::new(),
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1019,6 +1057,7 @@ fn constant_float() {
     let module = constant_module(Constant::Float {
         location: Default::default(),
         value: "1.0".into(),
+        float_value: LiteralFloatValue::ONE,
     });
 
     assert_eq!(roundtrip(&module), module);
@@ -1047,6 +1086,7 @@ fn constant_tuple() {
             Constant::Float {
                 location: Default::default(),
                 value: "1.0".into(),
+                float_value: LiteralFloatValue::ONE,
             },
             Constant::Tuple {
                 location: Default::default(),
@@ -1059,6 +1099,7 @@ fn constant_tuple() {
                     Constant::Float {
                         location: Default::default(),
                         value: "1.0".into(),
+                        float_value: LiteralFloatValue::ONE,
                     },
                 ],
             },
@@ -1101,7 +1142,7 @@ fn constant_record() {
         location: Default::default(),
         module: None,
         name: "".into(),
-        args: vec![
+        arguments: vec![
             CallArg {
                 implicit: None,
                 label: None,
@@ -1109,6 +1150,7 @@ fn constant_record() {
                 value: Constant::Float {
                     location: Default::default(),
                     value: "0.0".into(),
+                    float_value: LiteralFloatValue::ZERO,
                 },
             },
             CallArg {
@@ -1125,6 +1167,7 @@ fn constant_record() {
         tag: "thetag".into(),
         type_: type_::int(),
         field_map: None,
+        record_constructor: None,
     });
 
     assert_eq!(roundtrip(&module), module);
@@ -1228,6 +1271,7 @@ fn constant_var() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1425,6 +1469,7 @@ fn deprecated_type() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -1465,6 +1510,7 @@ fn module_fn_value_with_external_implementations() {
                         can_run_on_erlang: false,
                         can_run_on_javascript: true,
                     },
+                    purity: Purity::Impure,
                 },
             },
         )]
@@ -1476,6 +1522,7 @@ fn module_fn_value_with_external_implementations() {
         documentation: Vec::new(),
         contains_echo: false,
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1500,6 +1547,7 @@ fn module_containing_echo() {
         documentation: Vec::new(),
         contains_echo: true,
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1543,6 +1591,7 @@ fn internal_module_fn() {
                         can_run_on_erlang: true,
                         can_run_on_javascript: true,
                     },
+                    purity: Purity::Unknown,
                 },
             },
         )]
@@ -1555,6 +1604,7 @@ fn internal_module_fn() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1601,6 +1651,7 @@ fn internal_annotated_module_fn() {
                         can_run_on_erlang: true,
                         can_run_on_javascript: true,
                     },
+                    purity: Purity::Impure,
                 },
             },
         )]
@@ -1613,6 +1664,7 @@ fn internal_annotated_module_fn() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1638,14 +1690,17 @@ fn type_variable_ids_in_constructors_are_shared() {
                         TypeValueConstructorField {
                             type_: type_::generic_var(6),
                             label: None,
+                            documentation: Some("Here's some documentation".into()),
                         },
                         TypeValueConstructorField {
                             type_: type_::int(),
                             label: None,
+                            documentation: None,
                         },
                         TypeValueConstructorField {
                             type_: type_::tuple(vec![type_::generic_var(4), type_::generic_var(5)]),
                             label: None,
+                            documentation: None,
                         },
                     ],
                     documentation: None,
@@ -1663,6 +1718,7 @@ fn type_variable_ids_in_constructors_are_shared() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     let expected = HashMap::from([(
@@ -1675,14 +1731,17 @@ fn type_variable_ids_in_constructors_are_shared() {
                     TypeValueConstructorField {
                         type_: type_::generic_var(0),
                         label: None,
+                        documentation: Some("Here's some documentation".into()),
                     },
                     TypeValueConstructorField {
                         type_: type_::int(),
                         label: None,
+                        documentation: None,
                     },
                     TypeValueConstructorField {
                         type_: type_::tuple(vec![type_::generic_var(1), type_::generic_var(2)]),
                         label: None,
+                        documentation: None,
                     },
                 ],
                 documentation: None,
@@ -1707,14 +1766,18 @@ fn type_with_inferred_variant() {
             "Wibble".into(),
             TypeConstructor {
                 type_: Arc::new(Type::Named {
-                    publicity: Publicity::Public,
+                    publicity: Publicity::Internal {
+                        attribute_location: None,
+                    },
                     package: "some_package".into(),
                     module: "the/module".into(),
                     name: "Wibble".into(),
-                    args: Vec::new(),
+                    arguments: Vec::new(),
                     inferred_variant: Some(1),
                 }),
-                publicity: Publicity::Public,
+                publicity: Publicity::Internal {
+                    attribute_location: Some(SrcSpan::new(0, 10)),
+                },
                 origin: Default::default(),
                 module: "the/module".into(),
                 parameters: vec![],
@@ -1732,6 +1795,7 @@ fn type_with_inferred_variant() {
         type_aliases: HashMap::new(),
         documentation: Vec::new(),
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -1761,6 +1825,7 @@ fn module_with_type_aliases() {
                 deprecation: Deprecation::NotDeprecated,
                 documentation: Some("Some documentation".into()),
                 origin: Default::default(),
+                parameters: vec![type_::generic_var(0)],
             },
         )]
         .into(),
@@ -1768,6 +1833,7 @@ fn module_with_type_aliases() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -1796,6 +1862,7 @@ fn module_with_documentation() {
         contains_echo: false,
 
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
     assert_eq!(roundtrip(&module), module);
 }
@@ -1831,6 +1898,7 @@ fn module_with_opaque_type() {
         documentation: Vec::new(),
         contains_echo: false,
         references: References::default(),
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);
@@ -1921,6 +1989,7 @@ fn module_with_references() {
             )]
             .into(),
         },
+        inline_functions: HashMap::new(),
     };
 
     assert_eq!(roundtrip(&module), module);

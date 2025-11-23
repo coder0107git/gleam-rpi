@@ -8,7 +8,7 @@ use hexpm::version::Identifier;
 use crate::{
     analyse::TargetSupport,
     build::{Module, Origin, Package, Target},
-    config::{Docs, ErlangConfig, GleamVersion, JavaScriptConfig, PackageConfig, Repository},
+    config::{Docs, ErlangConfig, GleamVersion, JavaScriptConfig, PackageConfig},
     line_numbers::LineNumbers,
     type_::PRELUDE_MODULE_NAME,
     uid::UniqueIdGenerator,
@@ -88,6 +88,7 @@ pub fn compile_package(
             importable_modules: &modules,
             warnings: &TypeWarningEmitter::null(),
             direct_dependencies: &std::collections::HashMap::new(),
+            dev_dependencies: &std::collections::HashSet::new(),
             target_support: TargetSupport::Enforced,
             package_config: &config,
         }
@@ -115,6 +116,7 @@ pub fn compile_package(
         importable_modules: &modules,
         warnings: &TypeWarningEmitter::null(),
         direct_dependencies: &direct_dependencies,
+        dev_dependencies: &std::collections::HashSet::new(),
         target_support: TargetSupport::Enforced,
         package_config: &config,
     }
@@ -162,7 +164,7 @@ fn package_from_module(module: Module) -> Package {
             documentation: Docs { pages: vec![] },
             dependencies: std::collections::HashMap::new(),
             dev_dependencies: std::collections::HashMap::new(),
-            repository: Repository::default(),
+            repository: None,
             links: vec![],
             erlang: ErlangConfig::default(),
             javascript: JavaScriptConfig::default(),

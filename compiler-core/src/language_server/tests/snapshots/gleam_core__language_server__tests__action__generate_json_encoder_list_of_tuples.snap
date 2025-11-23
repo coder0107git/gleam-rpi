@@ -17,7 +17,7 @@ pub type Wibble {
   Wibble(values: List(#(Int, String)))
 }
 
-fn encode_wibble(wibble: Wibble) -> json.Json {
+fn wibble_to_json(wibble: Wibble) -> json.Json {
   let Wibble(values:) = wibble
   json.object([
     #("values", json.array(values, fn(value) {

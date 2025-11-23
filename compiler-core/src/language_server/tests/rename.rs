@@ -8,24 +8,28 @@ use crate::language_server::tests::{TestProject, find_position_of};
 
 use super::hover;
 
+/// Returns the rename range and edit to apply if the rename is valid and can be
+/// carried out.
+/// However if the rename produces an error response from the language server,
+/// the error message is returned.
 fn rename(
     tester: &TestProject<'_>,
     new_name: &str,
     position: Position,
-) -> Option<(Range, lsp_types::WorkspaceEdit)> {
+) -> Result<Option<(Range, lsp_types::WorkspaceEdit)>, String> {
     let prepare_rename_response = tester.at(position, |engine, params, _| {
         let params = TextDocumentPositionParams {
             text_document: params.text_document,
             position,
         };
         engine.prepare_rename(params).result.unwrap()
-    })?;
+    });
 
-    let lsp_types::PrepareRenameResponse::Range(range) = prepare_rename_response else {
-        return None;
+    let Some(lsp_types::PrepareRenameResponse::Range(range)) = prepare_rename_response else {
+        return Ok(None);
     };
 
-    let edit = tester.at(position, |engine, params, _| {
+    let outcome = tester.at(position, |engine, params, _| {
         let params = RenameParams {
             text_document_position: TextDocumentPositionParams {
                 text_document: params.text_document,
@@ -35,9 +39,13 @@ fn rename(
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         engine.rename(params).result.unwrap()
-    })?;
+    });
 
-    Some((range, edit))
+    match outcome {
+        Ok(Some(edit)) => Ok(Some((range, edit))),
+        Ok(None) => Ok(None),
+        Err(error) => Err(error.message),
+    }
 }
 
 fn apply_rename(
@@ -45,7 +53,9 @@ fn apply_rename(
     new_name: &str,
     position: Position,
 ) -> (Range, HashMap<String, String>) {
-    let (range, edit) = rename(tester, new_name, position).expect("Rename failed");
+    let (range, edit) = rename(tester, new_name, position)
+        .expect("Rename failed")
+        .expect("No rename produced");
     let changes = edit.changes.expect("No text edit found");
     (range, apply_code_edit(tester, changes))
 }
@@ -123,7 +133,22 @@ macro_rules! assert_no_rename {
         let src = $project.src;
         let position = $position.find_position(src);
         let result = rename($project, $new_name, position);
-        assert_eq!(result, None);
+        assert_eq!(result, Ok(None));
+    };
+}
+
+macro_rules! assert_rename_error {
+    ($code:literal, $new_name:literal, $position:expr $(,)?) => {
+        let project = TestProject::for_source($code);
+        assert_rename_error!(&project, $new_name, $position);
+    };
+
+    ($project:expr, $new_name:literal, $position:expr $(,)?) => {
+        let src = $project.src;
+        let position = $position.find_position(src);
+        let error = rename($project, $new_name, position).unwrap_err();
+        let snapshot = format!("Error response message:\n\n{error}");
+        insta::assert_snapshot!(insta::internals::AutoName, snapshot, src);
     };
 }
 
@@ -326,6 +351,24 @@ pub fn main() {
 }
 
 #[test]
+fn rename_local_variable_from_label_shorthand() {
+    assert_rename!(
+        "
+type Wibble {
+  Wibble(wibble: Int)
+}
+
+pub fn main() {
+  let wibble = todo
+  Wibble(wibble:)
+}
+",
+        "wobble",
+        find_position_of("wibble:)")
+    );
+}
+
+#[test]
 fn rename_local_variable_in_bit_array_pattern() {
     assert_rename!(
         "
@@ -374,7 +417,7 @@ pub fn main() {}
 
 #[test]
 fn no_rename_invalid_name() {
-    assert_no_rename!(
+    assert_rename_error!(
         "
 pub fn main() {
   let wibble = 10
@@ -565,7 +608,7 @@ pub fn something() {
 
 #[test]
 fn no_rename_function_with_invalid_name() {
-    assert_no_rename!(
+    assert_rename_error!(
         "
 pub fn main() {
   let wibble = 10
@@ -766,7 +809,7 @@ pub const something = 10
 
 #[test]
 fn no_rename_constant_with_invalid_name() {
-    assert_no_rename!(
+    assert_rename_error!(
         "
 const value = 10
 ",
@@ -929,7 +972,7 @@ pub fn main() {
 
 #[test]
 fn no_rename_type_variant_with_invalid_name() {
-    assert_no_rename!(
+    assert_rename_error!(
         "
 pub type Wibble {
   Constructor(Int)
@@ -1252,7 +1295,7 @@ pub fn main(w: Wibble) -> Wibble { todo }
 
 #[test]
 fn no_rename_type_with_invalid_name() {
-    assert_no_rename!(
+    assert_rename_error!(
         "
 type Wibble { Wobble }
 ",
@@ -1329,5 +1372,367 @@ pub type Wobble {
 ",
         "SomeType",
         find_position_of("Wibble")
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4553
+#[test]
+fn rename_local_variable_with_label_shorthand() {
+    assert_rename!(
+        "
+pub type Wibble {
+  Wibble(first: Int, second: Int)
+}
+
+pub fn main() {
+  let second = 2
+  Wibble(first: 1, second:)
+}
+",
+        "something",
+        find_position_of("second =")
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4748
+#[test]
+fn rename_alternative_pattern() {
+    assert_rename!(
+        "
+pub fn main(x) {
+  case x {
+    #(wibble, [wobble]) | #(wobble, [wibble, _]) | #(_, [wibble, wobble, ..]) ->
+      wibble + wobble
+    _ -> 0
+  }
+}
+",
+        "new_name",
+        find_position_of("wibble")
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/5091
+#[test]
+fn rename_alternative_pattern_aliases() {
+    assert_rename!(
+        "
+pub fn main(x) {
+  case x {
+    [] as list | [_] as list -> list
+    _ -> []
+  }
+}
+",
+        "new_name",
+        find_position_of("list")
+    );
+}
+
+#[test]
+fn rename_alternative_pattern_aliases_from_alternative() {
+    assert_rename!(
+        "
+pub fn main(x) {
+  case x {
+    [] as list | [_] as list -> list
+    _ -> []
+  }
+}
+",
+        "new_name",
+        find_position_of("list").nth_occurrence(2)
+    );
+}
+
+#[test]
+fn rename_alternative_pattern_aliases_from_usage() {
+    assert_rename!(
+        "
+pub fn main(x) {
+  case x {
+    [] as list | [_] as list -> list
+    _ -> []
+  }
+}
+",
+        "new_name",
+        find_position_of("list").nth_occurrence(3)
+    );
+}
+
+#[test]
+fn rename_alternative_pattern_alias_and_variable_1() {
+    assert_rename!(
+        "
+pub fn main(x) {
+  case x {
+    [] as list | [_, ..list] -> list
+    _ -> []
+  }
+}
+",
+        "new_name",
+        find_position_of("list").nth_occurrence(1)
+    );
+}
+
+#[test]
+fn rename_alternative_pattern_alias_and_variable_2() {
+    assert_rename!(
+        "
+pub fn main(x) {
+  case x {
+    [] as list | [_, ..list] -> list
+    _ -> []
+  }
+}
+",
+        "new_name",
+        find_position_of("list").nth_occurrence(2)
+    );
+}
+
+#[test]
+fn rename_alternative_pattern_alias_and_variable_3() {
+    assert_rename!(
+        "
+pub fn main(x) {
+  case x {
+    [_, ..list] | [] as list -> list
+    _ -> []
+  }
+}
+",
+        "new_name",
+        find_position_of("list").nth_occurrence(1)
+    );
+}
+
+#[test]
+fn rename_alternative_pattern_alias_and_variable_4() {
+    assert_rename!(
+        "
+pub fn main(x) {
+  case x {
+    [_, ..list] | [] as list -> list
+    _ -> []
+  }
+}
+",
+        "new_name",
+        find_position_of("list").nth_occurrence(2)
+    );
+}
+
+#[test]
+fn rename_alternative_pattern_from_usage() {
+    assert_rename!(
+        "
+pub fn main(x) {
+  case x {
+    #(wibble, [wobble]) | #(wobble, [wibble, _]) | #(_, [wibble, wobble, ..]) ->
+      wibble + wobble
+    _ -> 0
+  }
+}
+",
+        "new_name",
+        find_position_of("wibble +")
+    );
+}
+
+// https://github.com/gleam-lang/gleam/issues/4605
+#[test]
+fn rename_prelude_value() {
+    assert_rename!(
+        "
+pub fn main() {
+  Ok(10)
+}
+",
+        "Success",
+        find_position_of("Ok")
+    );
+}
+#[test]
+fn rename_prelude_type() {
+    assert_rename!(
+        "
+pub fn main() -> Result(Int, Nil) {
+  Ok(10)
+}
+",
+        "SuccessOrFailure",
+        find_position_of("Result")
+    );
+}
+
+#[test]
+fn rename_variable_with_alternative_pattern_with_same_name() {
+    assert_rename!(
+        "
+pub fn main(x) {
+  let some_var = 10
+
+  case x {
+    #(some_var, []) | #(_, [some_var]) ->
+      some_var
+    _ -> 0
+  }
+
+  some_var
+}
+",
+        "new_name",
+        find_position_of("some_var")
+    );
+}
+
+#[test]
+fn rename_prelude_value_with_prelude_already_imported() {
+    assert_rename!(
+        "
+import gleam
+
+pub fn main() {
+  Ok(gleam.Error(10))
+}
+",
+        "Success",
+        find_position_of("Ok")
+    );
+}
+
+#[test]
+fn rename_prelude_value_with_prelude_import_with_empty_braces() {
+    assert_rename!(
+        "
+import gleam.{}
+
+pub fn main() {
+  Ok(gleam.Error(10))
+}
+",
+        "Success",
+        find_position_of("Ok")
+    );
+}
+
+#[test]
+fn rename_prelude_value_with_other_prelude_value_imported() {
+    assert_rename!(
+        "
+import gleam.{Error}
+
+pub fn main() {
+  Ok(Error(10))
+}
+",
+        "Success",
+        find_position_of("Ok")
+    );
+}
+
+#[test]
+fn rename_prelude_type_with_prelude_value_imported_with_trailing_comma() {
+    assert_rename!(
+        "
+import gleam.{Error,}
+
+pub fn main() -> Result(Int, Nil) {
+  Error(10)
+}
+",
+        "OkOrError",
+        find_position_of("Result")
+    );
+}
+
+#[test]
+fn rename_prelude_value_with_other_module_imported() {
+    assert_rename!(
+        ("something", "pub type Something"),
+        "
+import something
+
+pub fn main() {
+  Ok(10)
+}
+",
+        "Success",
+        find_position_of("Ok")
+    );
+}
+
+#[test]
+fn rename_module_access_in_clause_guard() {
+    assert_rename!(
+        (
+            "wibble",
+            "
+import app
+
+pub fn main() {
+  case app.something {
+    thing if thing == app.something -> True
+    _ -> False
+  }
+}
+"
+        ),
+        "
+pub const something = 10
+",
+        "new_name",
+        find_position_of("something")
+    );
+}
+
+#[test]
+fn rename_variable_used_in_record_update() {
+    assert_rename!(
+        "
+type Wibble {
+  Wibble(a: Int, b: Int, c: Int)
+}
+
+fn wibble(wibble: Wibble) {
+  Wibble(..wibble, c: 1)
+}
+",
+        "value",
+        find_position_of("wibble:")
+    );
+}
+
+//https://github.com/gleam-lang/gleam/issues/4941
+#[test]
+fn rename_external_function() {
+    assert_rename!(
+        r#"
+pub fn main() { wibble() }
+
+@external(erlang, "a", "a")
+fn wibble() -> Nil
+"#,
+        "new_name",
+        find_position_of("wibble").nth_occurrence(2)
+    );
+}
+
+#[test]
+fn rename_external_javascript_function_with_pure_gleam_fallback() {
+    assert_rename!(
+        r#"
+pub fn main() { wibble() }
+
+@external(javascript, "a", "a")
+fn wibble() -> Nil {
+  Nil
+}
+"#,
+        "new_name",
+        find_position_of("wibble").nth_occurrence(2)
     );
 }
